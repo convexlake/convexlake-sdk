@@ -816,6 +816,11 @@ class ConvexLake:
         if first_type in ("orderbook_snapshot", "orderbook_delta"):
             return ConvexLake._kalshi_to_quote_ticks(messages, price_precision=price_precision)
 
+        # Polymarket: each file contains both YES and NO token quotes (two asset_ids).
+        # Filter to the YES token — the one whose initial mid is ≥ 0.5.
+        if "asset_id" in messages[0]:
+            messages = ConvexLake._polymarket_yes_token(messages)
+
         rows: list[dict] = []
         prec = price_precision
 
@@ -844,11 +849,12 @@ class ConvexLake:
                 bids = msg.get("bids", [])
                 asks = msg.get("asks", [])
                 if bids and asks:
-                    def _first(level: list) -> float:
-                        # handles both [price, size] and Bitfinex [price, count, amount]
-                        return float(level[0])
-                    bid = _first(bids[0])
-                    ask = _first(asks[0])
+                    def _lvprice(level) -> float:
+                        # handles [price, size], [price, count, amount], {"price": p, ...}
+                        return float(level["price"] if isinstance(level, dict) else level[0])
+                    # Polymarket book sorts bids ascending (worst first) — take max/min
+                    bid = max(_lvprice(lv) for lv in bids)
+                    ask = min(_lvprice(lv) for lv in asks)
 
             if bid is None or ask is None:
                 continue
@@ -864,6 +870,43 @@ class ConvexLake:
         df = pd.DataFrame(rows)
         df["ts_ns"] = df["ts_ns"].astype("uint64")
         return df
+
+    @staticmethod
+    def _polymarket_yes_token(messages: list[dict]) -> list[dict]:
+        """
+        Filter Polymarket messages to the YES token only.
+
+        Polymarket BBO and book files contain quotes for both YES and NO tokens
+        (two different asset_ids). They are complementary (bid_yes ≈ 1 - ask_no),
+        so mixing them produces duplicate / mirror-image ticks.  We keep only the
+        YES token — identified as the asset_id whose initial mid price is ≥ 0.5.
+        """
+        aid_mids: dict[str, list[float]] = {}
+        for m in messages:
+            aid = m.get("asset_id")
+            if not aid or aid in aid_mids:
+                continue
+            # extract a mid price from the first message of this asset
+            bid: float | None = None
+            ask: float | None = None
+            if "best_bid" in m and "best_ask" in m:
+                bid, ask = float(m["best_bid"]), float(m["best_ask"])
+            elif "bids" in m and "asks" in m:
+                def _p(lv) -> float:
+                    return float(lv["price"] if isinstance(lv, dict) else lv[0])
+                bids, asks = m["bids"], m["asks"]
+                if bids and asks:
+                    bid = max(_p(lv) for lv in bids)
+                    ask = min(_p(lv) for lv in asks)
+            if bid is not None and ask is not None and bid < ask:
+                aid_mids[aid] = [(bid + ask) / 2]
+
+        if not aid_mids:
+            return messages
+
+        # YES token: highest initial mid (closest to or above 0.5)
+        yes_aid = max(aid_mids, key=lambda a: aid_mids[a][0])
+        return [m for m in messages if m.get("asset_id", yes_aid) == yes_aid]
 
     @staticmethod
     def _kalshi_to_quote_ticks(
