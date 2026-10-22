@@ -565,6 +565,8 @@ class ConvexLake:
         rows: list[dict] = []
         seq: int = 0
 
+        _SIZE_CAP = 10_000_000_000  # 10B units — prevent uint64 overflow on Kalshi large fp values
+
         def _row(action: int, side: int, price: float, size: float,
                  ts_ns: int, flags: int = 0) -> dict:
             nonlocal seq
@@ -574,7 +576,7 @@ class ConvexLake:
                 "action":        action,
                 "side":          side,
                 "price":         round(float(price) * p_mult),
-                "size":          round(float(size)  * s_mult),
+                "size":          min(round(float(size) * s_mult), _SIZE_CAP),
                 "order_id":      0,
                 "flags":         flags,
                 "sequence":      seq,
@@ -662,7 +664,8 @@ class ConvexLake:
                     if delta == 0:
                         rows.append(_row(_ACTION_DELETE, side, price, 0, ts_ns, flags=_FLAG_LAST))
                     else:
-                        rows.append(_row(_ACTION_ADD, side, price, delta, ts_ns, flags=_FLAG_LAST))
+                        # abs(): delta_fp can be negative (decrement), only price matters for L2
+                        rows.append(_row(_ACTION_ADD, side, price, abs(delta), ts_ns, flags=_FLAG_LAST))
 
         else:
             # ── Non-Kalshi venues ───────────────────────────────────────────
