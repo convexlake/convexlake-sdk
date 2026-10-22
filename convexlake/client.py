@@ -808,6 +808,14 @@ class ConvexLake:
                 for row in df.itertuples()
             ]
         """
+        if not messages:
+            return pd.DataFrame(columns=["ts_ns", "bid", "ask"])
+
+        # Kalshi L2 format: stateful book reconstruction
+        first_type = messages[0].get("type", "")
+        if first_type in ("orderbook_snapshot", "orderbook_delta"):
+            return ConvexLake._kalshi_to_quote_ticks(messages, price_precision=price_precision)
+
         rows: list[dict] = []
         prec = price_precision
 
@@ -824,6 +832,14 @@ class ConvexLake:
             elif "best_bid" in msg and "best_ask" in msg:
                 bid = float(msg["best_bid"])
                 ask = float(msg["best_ask"])
+            elif "orderbook" in msg:
+                # Limitless: {"orderbook": {"bids": [{"price": p, ...}], "asks": [...]}}
+                ob   = msg["orderbook"]
+                bids = ob.get("bids", [])
+                asks = ob.get("asks", [])
+                if bids and asks:
+                    bid = float(bids[0]["price"])
+                    ask = float(asks[0]["price"])
             elif ("bids" in msg or "asks" in msg) and mtype != "update":
                 bids = msg.get("bids", [])
                 asks = msg.get("asks", [])
@@ -838,6 +854,96 @@ class ConvexLake:
                 continue
             bid = round(float(bid), prec)
             ask = round(float(ask), prec)
+            if bid >= ask:
+                continue
+            rows.append({"ts_ns": ts_ns, "bid": bid, "ask": ask})
+
+        if not rows:
+            return pd.DataFrame(columns=["ts_ns", "bid", "ask"])
+
+        df = pd.DataFrame(rows)
+        df["ts_ns"] = df["ts_ns"].astype("uint64")
+        return df
+
+    @staticmethod
+    def _kalshi_to_quote_ticks(
+        messages: list[dict],
+        *,
+        price_precision: int = 4,
+    ) -> pd.DataFrame:
+        """
+        Extract BBO from Kalshi L2 orderbook messages (orderbook_snapshot / orderbook_delta).
+
+        Kalshi binary markets have separate YES and NO bid books. The BBO for the YES
+        contract is: bid = best YES bid, ask = 1 - best NO bid.
+
+        When multiple markets are present (e.g. one file contains many strike prices),
+        the market whose initial YES bid is closest to 0.5 is selected as the ATM market.
+        """
+        prec = price_precision
+
+        # Pass 1: identify ATM market from initial snapshots
+        ticker_init: dict[str, float] = {}
+        for msg in messages:
+            if msg.get("type") != "orderbook_snapshot":
+                continue
+            inner  = msg.get("msg", {})
+            ticker = inner.get("market_ticker")
+            if not ticker or ticker in ticker_init:
+                continue
+            yes_lvs = inner.get("yes_dollars_fp", [])
+            if yes_lvs:
+                best = max(float(lv[0]) for lv in yes_lvs)
+                ticker_init[ticker] = best
+
+        if not ticker_init:
+            return pd.DataFrame(columns=["ts_ns", "bid", "ask"])
+
+        atm = min(ticker_init, key=lambda t: abs(ticker_init[t] - 0.5))
+
+        # Pass 2: reconstruct YES + NO books for ATM market only
+        yes_bids: dict[float, float] = {}
+        no_bids:  dict[float, float] = {}
+        rows: list[dict] = []
+
+        for msg in messages:
+            mtype  = msg.get("type", "")
+            inner  = msg.get("msg", {})
+            ticker = inner.get("market_ticker")
+            if ticker != atm:
+                continue
+
+            ts_ns = ConvexLake._get_ts_ns(msg)
+
+            if mtype == "orderbook_snapshot":
+                yes_bids = {}
+                no_bids  = {}
+                for lv in inner.get("yes_dollars_fp", []):
+                    p, s = float(lv[0]), float(lv[1])
+                    if s > 0:
+                        yes_bids[p] = s
+                for lv in inner.get("no_dollars_fp", []):
+                    p, s = float(lv[0]), float(lv[1])
+                    if s > 0:
+                        no_bids[p] = s
+
+            elif mtype == "orderbook_delta":
+                price = float(inner.get("price_dollars", 0))
+                delta = float(inner.get("delta_fp", 0))
+                side  = inner.get("side", "")
+                book  = yes_bids if side == "yes" else no_bids
+                if delta == 0:
+                    book.pop(price, None)
+                else:
+                    book[price] = delta
+            else:
+                continue
+
+            if not yes_bids or not no_bids:
+                continue
+
+            bid = round(max(yes_bids), prec)
+            ask = round(1.0 - max(no_bids), prec)
             if bid >= ask:
                 continue
             rows.append({"ts_ns": ts_ns, "bid": bid, "ask": ask})
