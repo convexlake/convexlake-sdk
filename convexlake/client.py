@@ -567,19 +567,28 @@ class ConvexLake:
                 "ts_init":       ts_ns,
             }
 
+        def _parse_level(level: list) -> tuple[float, float]:
+            # Bitfinex stores [price, count, amount]; all others store [price, size]
+            if len(level) == 3:
+                return float(level[0]), abs(float(level[2]))
+            return float(level[0]), float(level[1])
+
         for msg in messages:
             ts_ns  = ConvexLake._get_ts_ns(msg)
             mtype  = msg.get("type", "")
 
-            # ── Standard snapshot (most venues) ───────────────────────
-            if ("bids" in msg or "asks" in msg) and mtype != "bbo":
+            # ── Standard snapshot (most venues, including Bitfinex) ────
+            # Excludes "update" (Bitfinex/Deribit deltas) and "bbo" messages.
+            if ("bids" in msg or "asks" in msg) and mtype not in ("bbo", "update"):
                 bids = msg.get("bids", [])
                 asks = msg.get("asks", [])
                 rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
                 for level in bids:
-                    rows.append(_row(_ACTION_ADD, _SIDE_BUY, level[0], level[1], ts_ns))
+                    p, s = _parse_level(level)
+                    rows.append(_row(_ACTION_ADD, _SIDE_BUY, p, s, ts_ns))
                 for level in asks:
-                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, level[0], level[1], ts_ns))
+                    p, s = _parse_level(level)
+                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, p, s, ts_ns))
                 if rows:
                     rows[-1]["flags"] = _FLAG_LAST
 
@@ -596,6 +605,40 @@ class ConvexLake:
                     rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
                     rows.append(_row(_ACTION_ADD, _SIDE_BUY,  bp, bs,  ts_ns))
                     rows.append(_row(_ACTION_ADD, _SIDE_SELL, ap, as_, ts_ns, flags=_FLAG_LAST))
+
+            # ── Deribit L2 delta ───────────────────────────────────────
+            # {"type":"update","side":"bid"|"ask","action":"new"|"change"|"delete",
+            #  "price":p,"size":s,"local_timestamp":ms}
+            elif mtype == "update" and "side" in msg and "action" in msg:
+                side_str   = msg["side"]   # "bid" or "ask"
+                action_str = msg["action"] # "new", "change", "delete"
+                price      = float(msg.get("price", 0))
+                size       = float(msg.get("size",  0))
+                side       = _SIDE_BUY if side_str == "bid" else _SIDE_SELL
+                if action_str == "new":
+                    action = _ACTION_ADD
+                elif action_str == "change":
+                    action = _ACTION_UPDATE
+                else:  # "delete"
+                    action = _ACTION_DELETE
+                    size   = 0
+                rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
+
+            # ── Bitfinex L2 delta ──────────────────────────────────────
+            # {"type":"update","price":p,"count":c,"amount":a,"local_timestamp":ms}
+            # count==0 → delete level (amount sign encodes side); count>0 → add/update
+            elif mtype == "update" and "count" in msg and "amount" in msg:
+                price  = float(msg["price"])
+                count  = int(msg["count"])
+                amount = float(msg["amount"])
+                side   = _SIDE_BUY if amount >= 0 else _SIDE_SELL
+                if count == 0:
+                    action = _ACTION_DELETE
+                    size   = 0
+                else:
+                    action = _ACTION_ADD
+                    size   = abs(amount)
+                rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
 
             # ── Kalshi orderbook_snapshot ──────────────────────────────
             elif mtype == "orderbook_snapshot" and "msg" in msg:

@@ -782,6 +782,99 @@ class TestToNautilus:
         bids = df[df["side"] == 1]
         assert bids.iloc[0]["price"] == 650005
 
+    # ── Bitfinex 3-element levels ────────────────────────────────────────────
+
+    def test_bitfinex_snapshot_three_element_levels(self):
+        # Bitfinex: [price, count, amount]  size = abs(amount), NOT count
+        msg = {
+            "type": "snapshot",
+            "bids": [[65000.0, 5, 1.2]],   # count=5, amount=1.2
+            "asks": [[65001.0, 3, -0.8]],  # count=3, amount=-0.8
+            "local_timestamp": 0,
+        }
+        df = ConvexLake.to_nautilus([msg], "BTC-PERP.BITFINEX", price_precision=1, size_precision=2)
+        bids = df[df["side"] == 1]
+        asks = df[df["side"] == 2]
+        assert bids.iloc[0]["size"] == 120  # abs(1.2) * 10^2
+        assert asks.iloc[0]["size"] == 80   # abs(-0.8) * 10^2
+
+    def test_bitfinex_snapshot_not_using_count_as_size(self):
+        msg = {
+            "type": "snapshot",
+            "bids": [[0.53, 7, 3.5]],   # count=7, amount=3.5
+            "asks": [],
+            "local_timestamp": 0,
+        }
+        df = ConvexLake.to_nautilus([msg], "X.BITFINEX", price_precision=4, size_precision=2)
+        bids = df[df["side"] == 1]
+        # size should be 3.5 * 100 = 350, NOT 7 * 100 = 700
+        assert bids.iloc[0]["size"] == 350
+
+    # ── Deribit L2 delta (update messages) ───────────────────────────────────
+
+    _DERIBIT_NEW = {
+        "type": "update", "side": "bid", "action": "new",
+        "price": 65000.0, "size": 2.5, "local_timestamp": 1_700_000_000_000,
+    }
+    _DERIBIT_CHANGE = {
+        "type": "update", "side": "ask", "action": "change",
+        "price": 65100.0, "size": 1.0, "local_timestamp": 1_700_000_001_000,
+    }
+    _DERIBIT_DELETE = {
+        "type": "update", "side": "bid", "action": "delete",
+        "price": 65000.0, "size": 0.0, "local_timestamp": 1_700_000_002_000,
+    }
+
+    def test_deribit_new_maps_to_add(self):
+        df = ConvexLake.to_nautilus([self._DERIBIT_NEW], "BTC-PERP.DERIBIT", price_precision=1)
+        assert df.iloc[0]["action"] == 1   # ADD
+        assert df.iloc[0]["side"]   == 1   # BUY
+
+    def test_deribit_change_maps_to_update(self):
+        df = ConvexLake.to_nautilus([self._DERIBIT_CHANGE], "BTC-PERP.DERIBIT", price_precision=1)
+        assert df.iloc[0]["action"] == 2   # UPDATE
+        assert df.iloc[0]["side"]   == 2   # SELL
+
+    def test_deribit_delete_maps_to_delete(self):
+        df = ConvexLake.to_nautilus([self._DERIBIT_DELETE], "BTC-PERP.DERIBIT", price_precision=1)
+        assert df.iloc[0]["action"] == 3   # DELETE
+        assert df.iloc[0]["size"]   == 0
+
+    def test_deribit_update_f_last(self):
+        df = ConvexLake.to_nautilus([self._DERIBIT_NEW], "BTC-PERP.DERIBIT", price_precision=1)
+        assert df.iloc[-1]["flags"] == 1
+
+    # ── Bitfinex L2 delta (update messages) ──────────────────────────────────
+
+    _BITFINEX_ADD = {
+        "type": "update", "price": 65000.0, "count": 1, "amount": 2.5,
+        "local_timestamp": 1_700_000_000_000,
+    }
+    _BITFINEX_DELETE_BID = {
+        "type": "update", "price": 65000.0, "count": 0, "amount": 1.0,
+        "local_timestamp": 1_700_000_001_000,
+    }
+    _BITFINEX_DELETE_ASK = {
+        "type": "update", "price": 65100.0, "count": 0, "amount": -1.0,
+        "local_timestamp": 1_700_000_002_000,
+    }
+
+    def test_bitfinex_update_add_bid(self):
+        df = ConvexLake.to_nautilus([self._BITFINEX_ADD], "BTC-PERP.BITFINEX", price_precision=1)
+        assert df.iloc[0]["action"] == 1   # ADD
+        assert df.iloc[0]["side"]   == 1   # BUY (amount > 0)
+
+    def test_bitfinex_update_delete_bid(self):
+        df = ConvexLake.to_nautilus([self._BITFINEX_DELETE_BID], "BTC-PERP.BITFINEX", price_precision=1)
+        assert df.iloc[0]["action"] == 3   # DELETE
+        assert df.iloc[0]["side"]   == 1   # BUY (amount=+1.0 → bid)
+        assert df.iloc[0]["size"]   == 0
+
+    def test_bitfinex_update_delete_ask(self):
+        df = ConvexLake.to_nautilus([self._BITFINEX_DELETE_ASK], "BTC-PERP.BITFINEX", price_precision=1)
+        assert df.iloc[0]["action"] == 3   # DELETE
+        assert df.iloc[0]["side"]   == 2   # SELL (amount=-1.0 → ask)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Unit tests — download_nautilus (mocked HTTP)
