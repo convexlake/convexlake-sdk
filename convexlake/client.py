@@ -20,6 +20,16 @@ Usage:
 
     # Download volatility surface as a DataFrame
     df = client.surface(exchange="deribit", ticker="btc", date="2026-07-30", slug="BTC-2026-07-30.csv")
+
+    # Download orderbook and convert to NautilusTrader format
+    df = client.download_nautilus(
+        exchange="polymarket", slug="btc-updown-15m-1776943800.gz",
+        instrument_id="BTC.POLYMARKET", ticker="btc", timeframe="15m", date="2026-04-23",
+    )
+
+    # Or convert already-fetched messages
+    msgs = client.orderbook(exchange="limitless", slug="...", ticker="btc", date="2026-07-30")
+    df = ConvexLake.to_nautilus(msgs, instrument_id="BTC.LIMITLESS")
 """
 
 from __future__ import annotations
@@ -36,6 +46,22 @@ import requests
 from .exceptions import AuthError, ConvexLakeError, NotFoundError, PlanError, RateLimitError
 
 BASE_URL = "https://api.convexlake.com"
+
+# NautilusTrader BookAction values
+_ACTION_ADD    = 1
+_ACTION_UPDATE = 2
+_ACTION_DELETE = 3
+_ACTION_CLEAR  = 4
+
+# NautilusTrader OrderSide values
+_SIDE_BUY  = 1
+_SIDE_SELL = 2
+_SIDE_NONE = 0
+
+# RecordFlag.F_LAST — marks last delta in a snapshot sequence
+_FLAG_LAST = 1
+
+_TS_FIELDS = ("local_timestamp", "timestamp", "ts", "time", "created_at")
 
 
 class ConvexLake:
@@ -102,7 +128,7 @@ class ConvexLake:
         Parse an orderbook file into a list of dicts.
 
         Handles three on-disk formats:
-          "json"     → newline-delimited JSON objects (Limitless)
+          "json"     → newline-delimited JSON objects (Limitless, Hyperliquid, Binance, Deribit perps, Opinion)
           "python"   → newline-delimited Python dict literals (Polymarket BBO, Predict)
           "concat"   → concatenated Python dict literals with no separator (Kalshi)
           "auto"     → detect format from content structure
@@ -150,6 +176,27 @@ class ConvexLake:
 
         return records
 
+    @staticmethod
+    def _get_ts_ns(msg: dict) -> int:
+        """Extract timestamp from a message dict and return nanoseconds.
+
+        Epoch ranges (2001–2286):
+          ms  → 1e12–1e13   detect: v < 1e14
+          µs  → 1e15–1e16   detect: 1e14 ≤ v < 1e17
+          ns  → 1e18–1e19   detect: v ≥ 1e17
+        """
+        for field in _TS_FIELDS:
+            v = msg.get(field)
+            if v is not None:
+                v = int(v)
+                if v >= 100_000_000_000_000_000:   # ≥ 1e17 → nanoseconds
+                    return v
+                elif v >= 100_000_000_000_000:     # ≥ 1e14 → microseconds
+                    return v * 1_000
+                else:                               # < 1e14 → milliseconds
+                    return v * 1_000_000
+        return 0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -158,6 +205,7 @@ class ConvexLake:
         self,
         exchange: str | None = None,
         ticker: str | None = None,
+        market: str | None = None,
         timeframe: str | None = None,
         date: str | None = None,
     ) -> Any:
@@ -175,6 +223,7 @@ class ConvexLake:
         r = self._get("/info", {
             "exchange": exchange,
             "ticker": ticker,
+            "market": market,
             "timeframe": timeframe,
             "date": date,
         })
@@ -185,6 +234,7 @@ class ConvexLake:
         exchange: str,
         slug: str,
         ticker: str | None = None,
+        market: str | None = None,
         date: str | None = None,
         timeframe: str | None = None,
     ) -> pd.DataFrame:
@@ -203,6 +253,7 @@ class ConvexLake:
         r = self._get("/candles", {
             "exchange": exchange,
             "ticker": ticker,
+            "market": market,
             "timeframe": timeframe,
             "date": date,
             "slug": slug,
@@ -214,6 +265,7 @@ class ConvexLake:
         exchange: str,
         slug: str,
         ticker: str | None = None,
+        market: str | None = None,
         date: str | None = None,
         timeframe: str | None = None,
     ) -> pd.DataFrame:
@@ -230,6 +282,7 @@ class ConvexLake:
         r = self._get("/trades", {
             "exchange": exchange,
             "ticker": ticker,
+            "market": market,
             "timeframe": timeframe,
             "date": date,
             "slug": slug,
@@ -241,32 +294,34 @@ class ConvexLake:
         exchange: str,
         slug: str,
         ticker: str | None = None,
+        market: str | None = None,
         date: str | None = None,
         timeframe: str | None = None,
+        md_type: str | None = None,
         fmt: str = "auto",
     ) -> list[dict]:
         """
         Download orderbook data as a list of dicts.
 
         Each dict is one message/snapshot. Format varies by exchange:
-          kalshi:    orderbook_snapshot / orderbook_delta messages
-          polymarket: best_bid_ask BBO events
+          kalshi:    orderbook_snapshot / orderbook_delta messages (concat Python format)
+          polymarket: BBO events or full snapshots (Python dict format)
           predict:   full book snapshots with bids/asks arrays
           limitless: full book snapshots in JSON format
-          deribit:   returns a DataFrame (CSV format) — use orderbook_df() instead
+          hyperliquid, binance, deribit (perps), bitfinex, opinion: JSON snapshots
+          deribit (options): CSV format — use orderbook_df() instead
 
+        md_type: optional filter, e.g. "bbo" for best-bid/ask only files (Polymarket).
         fmt: "auto" (default), "json", or "python"
         """
-        if exchange.lower() == "deribit":
-            raise ConvexLakeError(
-                "Deribit orderbook is CSV format — use client.orderbook_df() instead."
-            )
         r = self._get("/orderbook", {
             "exchange": exchange,
             "ticker": ticker,
+            "market": market,
             "timeframe": timeframe,
             "date": date,
             "slug": slug,
+            "md_type": md_type,
         })
         raw = self._decompress(r)
         return self._parse_orderbook(raw, fmt=fmt)
@@ -276,20 +331,64 @@ class ConvexLake:
         exchange: str,
         slug: str,
         ticker: str | None = None,
+        market: str | None = None,
         date: str | None = None,
         timeframe: str | None = None,
     ) -> pd.DataFrame:
         """
-        Download orderbook data as a DataFrame (for exchanges that use CSV format: deribit).
+        Download orderbook data as a DataFrame (for CSV-format files: Deribit options).
         """
         r = self._get("/orderbook", {
             "exchange": exchange,
             "ticker": ticker,
+            "market": market,
             "timeframe": timeframe,
             "date": date,
             "slug": slug,
         })
         return self._to_df(self._decompress(r))
+
+    def orderbook_weather(
+        self,
+        exchange: str,
+        market: str,
+        date: str,
+        slug: str,
+        *,
+        presign: bool = False,
+        expires: int | None = None,
+    ) -> bytes | dict:
+        """
+        Download a weather orderbook file.
+
+        Parameters
+        ----------
+        exchange : str
+        market : str
+            Weather market identifier (e.g. city or station code).
+        date : str
+            Date in YYYY-MM-DD format.
+        slug : str
+            File name within the date folder.
+        presign : bool
+            If True, returns a JSON dict with a pre-signed download URL instead of raw bytes.
+        expires : int, optional
+            Pre-signed URL lifetime in seconds (60–3600, default 900). Only used when presign=True.
+        """
+        params: dict = {
+            "exchange": exchange,
+            "market": market,
+            "date": date,
+            "slug": slug,
+        }
+        if presign:
+            params["presign"] = "1"
+        if expires is not None:
+            params["expires"] = str(expires)
+        r = self._get("/orderbook-weather", params)
+        if presign:
+            return r.json()
+        return self._decompress(r)
 
     def surface(
         self,
@@ -358,7 +457,7 @@ class ConvexLake:
             Returns a DataFrame with per-trader fill history.
             client.leaderboard_trades(exchange="polymarket", address="0x...")
 
-        Supported exchanges: polymarket, limitless.
+        Supported exchanges: polymarket, limitless, predict-fun.
 
         Columns (polymarket step 2):
           proxyWallet, side, asset, conditionId, size, price, timestamp,
@@ -371,3 +470,236 @@ class ConvexLake:
         if address is None:
             return r.json()
         return self._to_df(self._decompress(r))
+
+    # ------------------------------------------------------------------
+    # NautilusTrader integration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def to_nautilus(
+        messages: list[dict],
+        instrument_id: str,
+        *,
+        price_precision: int = 4,
+        size_precision: int = 2,
+    ) -> pd.DataFrame:
+        """
+        Convert orderbook messages to a NautilusTrader-compatible OrderBookDelta DataFrame.
+
+        Each snapshot expands into a CLEAR action followed by ADD actions for all bid and
+        ask levels. The final ADD in each snapshot sequence carries flags=1 (F_LAST) to
+        signal that the book is complete at that point. BBO messages (best bid/offer only)
+        expand to CLEAR + two ADD actions. Kalshi delta messages map to ADD/UPDATE/DELETE.
+
+        Supported message formats
+        -------------------------
+        Snapshot (Polymarket full book, Limitless, Predict, Hyperliquid, Binance,
+        Deribit perps, Bitfinex, Opinion, HIP-4):
+            {"type": "snapshot", "bids": [[price, size], ...], "asks": [[...], ...],
+             "local_timestamp": <ms>}
+
+        BBO (Polymarket BBO files, Opinion BBO):
+            {"type": "bbo", "bid": price, "bid_size": size, "ask": price, "ask_size": size,
+             "local_timestamp": <ms>}
+            {"best_bid": price, "best_ask": price, "timestamp": <ms>}
+
+        Kalshi snapshot:
+            {"type": "orderbook_snapshot",
+             "msg": {"yes_dollars_fp": [[price_cents, size], ...],
+                     "no_dollars_fp": [[price_cents, size], ...]}}
+
+        Kalshi delta:
+            {"type": "orderbook_delta",
+             "msg": {"side": "yes"|"no", "price": <cents>, "delta": <int>}}
+
+        Parameters
+        ----------
+        messages : list[dict]
+            Raw messages from client.orderbook().
+        instrument_id : str
+            NautilusTrader instrument identifier, e.g. "TRUMP.POLYMARKET" or
+            "BTC-PERP.BINANCE".
+        price_precision : int
+            Decimal places for fixed-point price encoding (default 4).
+            Prediction markets: 4 (prices 0–1, e.g. 0.8400 → 8400).
+            Perpetuals: 1 (e.g. 65000.5 → 650005).
+        size_precision : int
+            Decimal places for fixed-point size encoding (default 2).
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: instrument_id, action, side, price, size, order_id, flags,
+            sequence, ts_event, ts_init.
+            Compatible with NautilusTrader's ParquetDataCatalog after converting
+            each row to an OrderBookDelta object.
+
+        Example — write to NautilusTrader catalog
+        ------------------------------------------
+            from nautilus_trader.model.data import OrderBookDelta
+            from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+            df = ConvexLake.to_nautilus(msgs, "TRUMP.POLYMARKET")
+            # build OrderBookDelta objects from df rows, then:
+            catalog = ParquetDataCatalog("./catalog")
+            catalog.write_data(deltas)
+        """
+        p_mult = 10 ** price_precision
+        s_mult = 10 ** size_precision
+
+        rows: list[dict] = []
+        seq: int = 0
+
+        def _row(action: int, side: int, price: float, size: float,
+                 ts_ns: int, flags: int = 0) -> dict:
+            nonlocal seq
+            seq += 1
+            return {
+                "instrument_id": instrument_id,
+                "action":        action,
+                "side":          side,
+                "price":         round(float(price) * p_mult),
+                "size":          round(float(size)  * s_mult),
+                "order_id":      0,
+                "flags":         flags,
+                "sequence":      seq,
+                "ts_event":      ts_ns,
+                "ts_init":       ts_ns,
+            }
+
+        for msg in messages:
+            ts_ns  = ConvexLake._get_ts_ns(msg)
+            mtype  = msg.get("type", "")
+
+            # ── Standard snapshot (most venues) ───────────────────────
+            if ("bids" in msg or "asks" in msg) and mtype != "bbo":
+                bids = msg.get("bids", [])
+                asks = msg.get("asks", [])
+                rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
+                for level in bids:
+                    rows.append(_row(_ACTION_ADD, _SIDE_BUY, level[0], level[1], ts_ns))
+                for level in asks:
+                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, level[0], level[1], ts_ns))
+                if rows:
+                    rows[-1]["flags"] = _FLAG_LAST
+
+            # ── BBO (bid/ask top-of-book only) ─────────────────────────
+            elif mtype == "bbo" or "best_bid" in msg or ("bid" in msg and "ask" in msg
+                                                         and "bids" not in msg):
+                if mtype == "bbo":
+                    bp, bs = msg.get("bid"),      msg.get("bid_size", 0)
+                    ap, as_ = msg.get("ask"),     msg.get("ask_size", 0)
+                else:
+                    bp, bs  = msg.get("best_bid"), msg.get("bid_size", 1)
+                    ap, as_ = msg.get("best_ask"), msg.get("ask_size", 1)
+                if bp is not None and ap is not None:
+                    rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
+                    rows.append(_row(_ACTION_ADD, _SIDE_BUY,  bp, bs,  ts_ns))
+                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, ap, as_, ts_ns, flags=_FLAG_LAST))
+
+            # ── Kalshi orderbook_snapshot ──────────────────────────────
+            elif mtype == "orderbook_snapshot" and "msg" in msg:
+                inner = msg["msg"]
+                yes_levels = inner.get("yes_dollars_fp", [])
+                no_levels  = inner.get("no_dollars_fp",  [])
+                rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
+                for lv in yes_levels:
+                    rows.append(_row(_ACTION_ADD, _SIDE_BUY,  lv[0] / 100, lv[1], ts_ns))
+                for lv in no_levels:
+                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, lv[0] / 100, lv[1], ts_ns))
+                if rows:
+                    rows[-1]["flags"] = _FLAG_LAST
+
+            # ── Kalshi orderbook_delta ─────────────────────────────────
+            elif mtype == "orderbook_delta" and "msg" in msg:
+                inner  = msg["msg"]
+                side   = _SIDE_BUY if inner.get("side") == "yes" else _SIDE_SELL
+                price  = inner.get("price", 0) / 100
+                delta  = inner.get("delta", 0)
+                if delta == 0:
+                    action = _ACTION_DELETE
+                    size   = 0
+                elif delta > 0:
+                    action = _ACTION_ADD
+                    size   = delta
+                else:
+                    action = _ACTION_UPDATE
+                    size   = abs(delta)
+                rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
+
+        if not rows:
+            return pd.DataFrame(columns=[
+                "instrument_id", "action", "side", "price", "size",
+                "order_id", "flags", "sequence", "ts_event", "ts_init",
+            ])
+
+        df = pd.DataFrame(rows)
+        df = df.astype({
+            "action":   "uint8",
+            "side":     "uint8",
+            "price":    "int64",
+            "size":     "uint64",
+            "order_id": "uint64",
+            "flags":    "uint8",
+            "sequence": "uint64",
+            "ts_event": "uint64",
+            "ts_init":  "uint64",
+        })
+        return df
+
+    def download_nautilus(
+        self,
+        exchange: str,
+        instrument_id: str,
+        slug: str,
+        *,
+        ticker: str | None = None,
+        market: str | None = None,
+        date: str | None = None,
+        timeframe: str | None = None,
+        md_type: str | None = None,
+        price_precision: int = 4,
+        size_precision: int = 2,
+    ) -> pd.DataFrame:
+        """
+        Download orderbook data and return a NautilusTrader-compatible OrderBookDelta DataFrame.
+
+        Convenience wrapper combining client.orderbook() and client.to_nautilus().
+
+        Parameters
+        ----------
+        exchange : str
+            Exchange name: "polymarket", "kalshi", "limitless", "predict-fun",
+            "hyperliquid", "binance", "deribit", "bitfinex", "opinion", etc.
+        instrument_id : str
+            NautilusTrader instrument identifier, e.g. "TRUMP.POLYMARKET".
+        slug : str
+            File name within the date folder (no extension required for .gz files).
+        ticker, market, date, timeframe, md_type : optional
+            Passed through to client.orderbook().
+        price_precision : int
+            Fixed-point precision for prices. Default 4 (suitable for prediction markets
+            with 0–1 prices). Use 1–2 for perpetuals.
+        size_precision : int
+            Fixed-point precision for sizes. Default 2.
+
+        Returns
+        -------
+        pd.DataFrame
+            NautilusTrader OrderBookDelta schema. See to_nautilus() for column details.
+        """
+        messages = self.orderbook(
+            exchange=exchange,
+            slug=slug,
+            ticker=ticker,
+            market=market,
+            date=date,
+            timeframe=timeframe,
+            md_type=md_type,
+        )
+        return self.to_nautilus(
+            messages,
+            instrument_id=instrument_id,
+            price_precision=price_precision,
+            size_precision=size_precision,
+        )

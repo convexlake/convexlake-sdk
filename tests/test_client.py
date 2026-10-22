@@ -259,19 +259,6 @@ class TestErrorMapping:
         assert len(df) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit tests — deribit orderbook guard
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestDeribitOrderbookGuard:
-    @resp.activate
-    def test_orderbook_deribit_raises_helpful_error(self):
-        """orderbook() for deribit always raises pointing to orderbook_df()."""
-        with pytest.raises(ConvexLakeError, match="orderbook_df"):
-            ConvexLake(api_key="k").orderbook(
-                exchange="deribit", slug="BTC-28AUG26-80000-C-book.csv",
-                ticker="BTC", date="2026-08-07")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration tests — /info
@@ -557,3 +544,438 @@ class TestLeaderboardTrades:
         result = client.leaderboard_trades(exchange="limitless")
         assert isinstance(result, dict)
         assert "addresses" in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — _get_ts_ns
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetTsNs:
+    def test_milliseconds_converted(self):
+        msg = {"local_timestamp": 1_700_000_000_000}
+        assert ConvexLake._get_ts_ns(msg) == 1_700_000_000_000 * 1_000_000
+
+    def test_nanoseconds_passed_through(self):
+        ns = 1_700_000_000_000_000_000
+        msg = {"local_timestamp": ns}
+        assert ConvexLake._get_ts_ns(msg) == ns
+
+    def test_microseconds_converted(self):
+        us = 1_700_000_000_000_000
+        msg = {"ts": us}
+        assert ConvexLake._get_ts_ns(msg) == us * 1_000
+
+    def test_falls_back_through_field_list(self):
+        msg = {"timestamp": 1_700_000_000_000}
+        assert ConvexLake._get_ts_ns(msg) > 0
+
+    def test_missing_ts_returns_zero(self):
+        assert ConvexLake._get_ts_ns({}) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — to_nautilus
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SNAP_MSG = {
+    "type": "snapshot",
+    "bids": [["0.79", 5.0], ["0.39", 12.0]],
+    "asks": [["0.84", 163.625], ["0.86", 9.75]],
+    "local_timestamp": 1_792_513_420_185,
+}
+_BBO_MSG = {
+    "type": "bbo",
+    "bid": 0.53, "bid_size": 100.0,
+    "ask": 0.56, "ask_size":  50.0,
+    "local_timestamp": 1_792_513_430_000,
+}
+_BEST_BBO_MSG = {
+    "best_bid": 0.60, "best_ask": 0.62,
+    "timestamp": 1_792_513_440_000,
+}
+_KALSHI_SNAP = {
+    "type": "orderbook_snapshot",
+    "msg": {
+        "yes_dollars_fp": [[53, 10], [52, 5]],
+        "no_dollars_fp":  [[47, 8],  [48, 3]],
+    },
+}
+_KALSHI_DELTA_ADD = {
+    "type": "orderbook_delta",
+    "msg": {"side": "yes", "price": 54, "delta": 7},
+}
+_KALSHI_DELTA_DEL = {
+    "type": "orderbook_delta",
+    "msg": {"side": "no", "price": 48, "delta": 0},
+}
+
+
+class TestToNautilus:
+    ISTR = "TRUMP.POLYMARKET"
+
+    def _basic(self, msgs=None):
+        return ConvexLake.to_nautilus(
+            msgs or [_SNAP_MSG], self.ISTR, price_precision=4, size_precision=2,
+        )
+
+    # ── Output shape ──────────────────────────────────────────────────────────
+
+    def test_returns_dataframe(self):
+        df = self._basic()
+        assert isinstance(df, pd.DataFrame)
+
+    def test_expected_columns(self):
+        df = self._basic()
+        expected = {"instrument_id", "action", "side", "price", "size",
+                    "order_id", "flags", "sequence", "ts_event", "ts_init"}
+        assert expected == set(df.columns)
+
+    def test_empty_input_returns_empty_df(self):
+        df = ConvexLake.to_nautilus([], self.ISTR)
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 0
+
+    def test_dtypes(self):
+        df = self._basic()
+        assert df["action"].dtype   == "uint8"
+        assert df["side"].dtype     == "uint8"
+        assert df["price"].dtype    == "int64"
+        assert df["size"].dtype     == "uint64"
+        assert df["order_id"].dtype == "uint64"
+        assert df["flags"].dtype    == "uint8"
+        assert df["sequence"].dtype == "uint64"
+        assert df["ts_event"].dtype == "uint64"
+        assert df["ts_init"].dtype  == "uint64"
+
+    # ── Snapshot expansion ────────────────────────────────────────────────────
+
+    def test_snapshot_starts_with_clear(self):
+        df = self._basic()
+        assert df.iloc[0]["action"] == 4  # CLEAR
+
+    def test_snapshot_clear_side_is_none(self):
+        df = self._basic()
+        assert df.iloc[0]["side"] == 0
+
+    def test_snapshot_bids_are_buy(self):
+        df = self._basic()
+        adds = df[df["action"] == 1]
+        bid_rows = adds[adds["side"] == 1]
+        assert len(bid_rows) == 2
+
+    def test_snapshot_asks_are_sell(self):
+        df = self._basic()
+        adds = df[df["action"] == 1]
+        ask_rows = adds[adds["side"] == 2]
+        assert len(ask_rows) == 2
+
+    def test_snapshot_row_count(self):
+        df = self._basic()
+        # 1 CLEAR + 2 bids + 2 asks = 5
+        assert len(df) == 5
+
+    def test_snapshot_last_row_has_flag_f_last(self):
+        df = self._basic()
+        assert df.iloc[-1]["flags"] == 1
+
+    def test_snapshot_non_last_rows_have_flag_zero(self):
+        df = self._basic()
+        assert (df.iloc[:-1]["flags"] == 0).all()
+
+    def test_price_fixed_point_encoding(self):
+        df = self._basic()
+        best_bid_row = df[(df["action"] == 1) & (df["side"] == 1)].iloc[0]
+        # 0.79 * 10^4 = 7900
+        assert best_bid_row["price"] == 7900
+
+    def test_size_fixed_point_encoding(self):
+        df = self._basic()
+        best_bid_row = df[(df["action"] == 1) & (df["side"] == 1)].iloc[0]
+        # 5.0 * 10^2 = 500
+        assert best_bid_row["size"] == 500
+
+    def test_timestamp_nanoseconds(self):
+        df = self._basic()
+        expected_ns = 1_792_513_420_185 * 1_000_000
+        assert (df["ts_event"] == expected_ns).all()
+
+    def test_ts_event_equals_ts_init(self):
+        df = self._basic()
+        assert (df["ts_event"] == df["ts_init"]).all()
+
+    def test_instrument_id_set(self):
+        df = self._basic()
+        assert (df["instrument_id"] == self.ISTR).all()
+
+    def test_order_id_is_zero(self):
+        df = self._basic()
+        assert (df["order_id"] == 0).all()
+
+    def test_sequence_monotonic(self):
+        df = self._basic()
+        assert list(df["sequence"]) == list(range(1, len(df) + 1))
+
+    # ── Multiple snapshots → sequence continues ───────────────────────────────
+
+    def test_two_snapshots_sequence_is_continuous(self):
+        df = ConvexLake.to_nautilus([_SNAP_MSG, _SNAP_MSG], self.ISTR)
+        assert df["sequence"].is_monotonic_increasing
+        assert df.iloc[-1]["sequence"] == 10  # 5 rows × 2
+
+    def test_each_snapshot_ends_with_flag(self):
+        df = ConvexLake.to_nautilus([_SNAP_MSG, _SNAP_MSG], self.ISTR)
+        flagged = df[df["flags"] == 1]
+        assert len(flagged) == 2  # one per snapshot
+
+    # ── BBO messages ─────────────────────────────────────────────────────────
+
+    def test_bbo_produces_three_rows(self):
+        df = ConvexLake.to_nautilus([_BBO_MSG], self.ISTR, price_precision=4)
+        assert len(df) == 3  # CLEAR + BUY + SELL
+
+    def test_bbo_last_row_f_last(self):
+        df = ConvexLake.to_nautilus([_BBO_MSG], self.ISTR)
+        assert df.iloc[-1]["flags"] == 1
+
+    def test_bbo_best_bid_ask_format(self):
+        df = ConvexLake.to_nautilus([_BEST_BBO_MSG], self.ISTR)
+        assert len(df) == 3
+
+    # ── Kalshi snapshot ───────────────────────────────────────────────────────
+
+    def test_kalshi_snapshot_row_count(self):
+        df = ConvexLake.to_nautilus([_KALSHI_SNAP], self.ISTR, price_precision=4)
+        # 1 CLEAR + 2 yes (bids) + 2 no (asks) = 5
+        assert len(df) == 5
+
+    def test_kalshi_snapshot_price_in_cents_normalized(self):
+        df = ConvexLake.to_nautilus([_KALSHI_SNAP], self.ISTR, price_precision=4)
+        bids = df[(df["action"] == 1) & (df["side"] == 1)]
+        # 53 cents / 100 = 0.53 → 0.53 * 10^4 = 5300
+        assert bids.iloc[0]["price"] == 5300
+
+    def test_kalshi_snapshot_ends_with_f_last(self):
+        df = ConvexLake.to_nautilus([_KALSHI_SNAP], self.ISTR)
+        assert df.iloc[-1]["flags"] == 1
+
+    # ── Kalshi delta ─────────────────────────────────────────────────────────
+
+    def test_kalshi_delta_add(self):
+        df = ConvexLake.to_nautilus([_KALSHI_DELTA_ADD], self.ISTR, price_precision=4)
+        assert len(df) == 1
+        assert df.iloc[0]["action"] == 1   # ADD
+        assert df.iloc[0]["side"]   == 1   # BUY (yes)
+        assert df.iloc[0]["size"]   == 700 # 7 * 10^2
+        assert df.iloc[0]["flags"]  == 1   # F_LAST
+
+    def test_kalshi_delta_delete(self):
+        df = ConvexLake.to_nautilus([_KALSHI_DELTA_DEL], self.ISTR, price_precision=4)
+        assert df.iloc[0]["action"] == 3   # DELETE
+        assert df.iloc[0]["side"]   == 2   # SELL (no)
+
+    # ── Custom precision ─────────────────────────────────────────────────────
+
+    def test_price_precision_applied(self):
+        msg = {"bids": [["65000.5", 1.0]], "asks": [], "local_timestamp": 0}
+        df = ConvexLake.to_nautilus([msg], "BTC-PERP.BINANCE", price_precision=1)
+        # 65000.5 * 10 = 650005
+        bids = df[df["side"] == 1]
+        assert bids.iloc[0]["price"] == 650005
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — download_nautilus (mocked HTTP)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDownloadNautilus:
+    @resp.activate
+    def test_returns_nautilus_dataframe(self):
+        msgs = [_SNAP_MSG]
+        raw = gzip.compress(_ndl_json(msgs))
+        resp.add(resp.GET, f"{BASE_URL}/orderbook", body=raw,
+                 content_type="application/gzip")
+        df = ConvexLake(api_key="k").download_nautilus(
+            exchange="polymarket",
+            instrument_id="TRUMP.POLYMARKET",
+            slug="some-market-book.gz",
+            ticker="btc", date="2026-04-23",
+        )
+        assert isinstance(df, pd.DataFrame)
+        assert "action" in df.columns
+        assert len(df) == 5  # 1 CLEAR + 2 bids + 2 asks
+
+    @resp.activate
+    def test_price_precision_forwarded(self):
+        msgs = [{"bids": [["0.79", 5.0]], "asks": [], "local_timestamp": 0}]
+        raw = gzip.compress(_ndl_json(msgs))
+        resp.add(resp.GET, f"{BASE_URL}/orderbook", body=raw,
+                 content_type="application/gzip")
+        df = ConvexLake(api_key="k").download_nautilus(
+            exchange="polymarket",
+            instrument_id="TRUMP.POLYMARKET",
+            slug="some-market-book.gz",
+            price_precision=2,
+        )
+        bids = df[df["side"] == 1]
+        assert bids.iloc[0]["price"] == 79  # 0.79 * 10^2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — orderbook new params (market, md_type)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOrderbookNewParams:
+    @resp.activate
+    def test_market_param_forwarded(self):
+        raw = gzip.compress(_ndl_json([_SNAP_MSG]))
+        resp.add(resp.GET, f"{BASE_URL}/orderbook", body=raw,
+                 content_type="application/gzip")
+        ConvexLake(api_key="k").orderbook(
+            exchange="opinion", slug="some-book.gz",
+            market="BTCUSDT", date="2026-10-01",
+        )
+        call = resp.calls[0]
+        assert "market=BTCUSDT" in call.request.url
+
+    @resp.activate
+    def test_md_type_param_forwarded(self):
+        raw = gzip.compress(_ndl_json([_SNAP_MSG]))
+        resp.add(resp.GET, f"{BASE_URL}/orderbook", body=raw,
+                 content_type="application/gzip")
+        ConvexLake(api_key="k").orderbook(
+            exchange="polymarket", slug="btc-bbo.gz",
+            ticker="btc", date="2026-10-01", md_type="bbo",
+        )
+        call = resp.calls[0]
+        assert "md_type=bbo" in call.request.url
+
+    @resp.activate
+    def test_none_params_not_forwarded(self):
+        raw = gzip.compress(_ndl_json([_SNAP_MSG]))
+        resp.add(resp.GET, f"{BASE_URL}/orderbook", body=raw,
+                 content_type="application/gzip")
+        ConvexLake(api_key="k").orderbook(
+            exchange="polymarket", slug="btc-bbo.gz",
+        )
+        call = resp.calls[0]
+        assert "market=" not in call.request.url
+        assert "md_type=" not in call.request.url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — orderbook_weather
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOrderbookWeather:
+    @resp.activate
+    def test_returns_raw_bytes(self):
+        raw = gzip.compress(b"some,weather,data\n1,2,3\n")
+        resp.add(resp.GET, f"{BASE_URL}/orderbook-weather", body=raw,
+                 content_type="application/gzip")
+        result = ConvexLake(api_key="k").orderbook_weather(
+            exchange="weather", market="NYC",
+            date="2026-10-01", slug="NYC-2026-10-01.gz",
+        )
+        assert isinstance(result, bytes)
+
+    @resp.activate
+    def test_presign_returns_dict(self):
+        resp.add(resp.GET, f"{BASE_URL}/orderbook-weather",
+                 json={"url": "https://s3.example.com/presigned?token=abc"},
+                 content_type="application/json")
+        result = ConvexLake(api_key="k").orderbook_weather(
+            exchange="weather", market="NYC",
+            date="2026-10-01", slug="NYC-2026-10-01.gz",
+            presign=True,
+        )
+        assert isinstance(result, dict)
+        assert "url" in result
+
+    @resp.activate
+    def test_presign_param_forwarded(self):
+        resp.add(resp.GET, f"{BASE_URL}/orderbook-weather",
+                 json={"url": "https://example.com/file"},
+                 content_type="application/json")
+        ConvexLake(api_key="k").orderbook_weather(
+            exchange="weather", market="NYC",
+            date="2026-10-01", slug="NYC-2026-10-01.gz",
+            presign=True, expires=600,
+        )
+        call = resp.calls[0]
+        assert "presign=1" in call.request.url
+        assert "expires=600" in call.request.url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — info market param
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInfoMarketParam:
+    @resp.activate
+    def test_market_param_forwarded(self):
+        resp.add(resp.GET, f"{BASE_URL}/info",
+                 json={"tier": "free", "folders": []})
+        ConvexLake(api_key="k").info(exchange="opinion", market="BTCUSDT")
+        call = resp.calls[0]
+        assert "market=BTCUSDT" in call.request.url
+
+    @resp.activate
+    def test_market_none_not_forwarded(self):
+        resp.add(resp.GET, f"{BASE_URL}/info",
+                 json={"tier": "free", "folders": []})
+        ConvexLake(api_key="k").info(exchange="polymarket")
+        call = resp.calls[0]
+        assert "market=" not in call.request.url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integration tests — to_nautilus on real Kalshi data
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestToNautilusKalshiIntegration:
+    def test_kalshi_orderbook_converts_to_nautilus(self, client):
+        msgs = client.orderbook(**KALSHI_ORDERBOOK)
+        df = ConvexLake.to_nautilus(msgs, "KXBTC15M.KALSHI", price_precision=4)
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) > 0
+        assert set(df["action"]).issubset({1, 2, 3, 4})  # valid NautilusTrader actions
+
+    def test_kalshi_nautilus_dtypes(self, client):
+        msgs = client.orderbook(**KALSHI_ORDERBOOK)
+        df = ConvexLake.to_nautilus(msgs, "KXBTC15M.KALSHI", price_precision=4)
+        assert df["price"].dtype  == "int64"
+        assert df["ts_event"].dtype == "uint64"
+
+    def test_kalshi_nautilus_prices_in_range(self, client):
+        msgs = client.orderbook(**KALSHI_ORDERBOOK)
+        df = ConvexLake.to_nautilus(msgs, "KXBTC15M.KALSHI", price_precision=4)
+        adds = df[df["action"] == 1]
+        # Prices with precision=4 for 0-1 range: should be 0–10000
+        assert (adds["price"] >= 0).all()
+        assert (adds["price"] <= 10000).all()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integration tests — to_nautilus on real Polymarket BBO data
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestToNautilusPolymarketIntegration:
+    def test_polymarket_bbo_converts(self, client):
+        msgs = client.orderbook(**POLY_ORDERBOOK)
+        df = ConvexLake.to_nautilus(msgs, "BTC-UPDOWN-15M.POLYMARKET")
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) > 0
+
+    def test_polymarket_bbo_actions_valid(self, client):
+        msgs = client.orderbook(**POLY_ORDERBOOK)
+        df = ConvexLake.to_nautilus(msgs, "BTC-UPDOWN-15M.POLYMARKET")
+        assert set(df["action"]).issubset({1, 2, 3, 4})
+
+    def test_download_nautilus_integration(self, client):
+        df = client.download_nautilus(
+            instrument_id="BTC-UPDOWN-15M.POLYMARKET",
+            **POLY_ORDERBOOK,
+        )
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) > 0
+        assert "ts_event" in df.columns
