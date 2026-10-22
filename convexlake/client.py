@@ -489,28 +489,36 @@ class ConvexLake:
         Each snapshot expands into a CLEAR action followed by ADD actions for all bid and
         ask levels. The final ADD in each snapshot sequence carries flags=1 (F_LAST) to
         signal that the book is complete at that point. BBO messages (best bid/offer only)
-        expand to CLEAR + two ADD actions. Kalshi delta messages map to ADD/UPDATE/DELETE.
+        expand to CLEAR + two ADD actions. Kalshi delta messages map to ADD/DELETE.
 
         Supported message formats
         -------------------------
-        Snapshot (Polymarket full book, Limitless, Predict, Hyperliquid, Binance,
+        Snapshot (Polymarket full book, Predict, Hyperliquid, Binance,
         Deribit perps, Bitfinex, Opinion, HIP-4):
             {"type": "snapshot", "bids": [[price, size], ...], "asks": [[...], ...],
              "local_timestamp": <ms>}
+
+        Polymarket full book (dict-style levels, YES token filtered automatically):
+            {"asset_id": "...", "bids": [{"price": "0.52", "size": "1000"}, ...], ...}
+
+        Limitless (nested orderbook key):
+            {"orderbook": {"bids": [{"price": 0.52, "size": 1000}, ...], "asks": [...]},
+             "timestamp": <ms>}
 
         BBO (Polymarket BBO files, Opinion BBO):
             {"type": "bbo", "bid": price, "bid_size": size, "ask": price, "ask_size": size,
              "local_timestamp": <ms>}
             {"best_bid": price, "best_ask": price, "timestamp": <ms>}
 
-        Kalshi snapshot:
+        Kalshi snapshot (ATM market selected automatically):
             {"type": "orderbook_snapshot",
-             "msg": {"yes_dollars_fp": [[price_cents, size], ...],
-                     "no_dollars_fp": [[price_cents, size], ...]}}
+             "msg": {"market_ticker": "...", "yes_dollars_fp": [[price, size], ...],
+                     "no_dollars_fp": [[price, size], ...]}}
 
         Kalshi delta:
             {"type": "orderbook_delta",
-             "msg": {"side": "yes"|"no", "price": <cents>, "delta": <int>}}
+             "msg": {"market_ticker": "...", "side": "yes"|"no",
+                     "price_dollars": <float>, "delta_fp": <float>}}
 
         Parameters
         ----------
@@ -544,6 +552,13 @@ class ConvexLake:
             catalog = ParquetDataCatalog("./catalog")
             catalog.write_data(deltas)
         """
+        _empty_cols = [
+            "instrument_id", "action", "side", "price", "size",
+            "order_id", "flags", "sequence", "ts_event", "ts_init",
+        ]
+        if not messages:
+            return pd.DataFrame(columns=_empty_cols)
+
         p_mult = 10 ** price_precision
         s_mult = 10 ** size_precision
 
@@ -567,114 +582,154 @@ class ConvexLake:
                 "ts_init":       ts_ns,
             }
 
-        def _parse_level(level: list) -> tuple[float, float]:
-            # Bitfinex stores [price, count, amount]; all others store [price, size]
+        def _level(level) -> tuple[float, float]:
+            """Extract (price, size) from a level entry (list, tuple, or dict)."""
+            if isinstance(level, dict):
+                p = float(level["price"])
+                s = float(level.get("size", level.get("amount", 0)))
+                return p, s
+            # Bitfinex: [price, count, amount]; all others: [price, size]
             if len(level) == 3:
                 return float(level[0]), abs(float(level[2]))
             return float(level[0]), float(level[1])
 
-        for msg in messages:
-            ts_ns  = ConvexLake._get_ts_ns(msg)
-            mtype  = msg.get("type", "")
+        def _emit_snapshot(bids: list, asks: list, ts_ns: int) -> None:
+            rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
+            for lv in bids:
+                p, s = _level(lv)
+                rows.append(_row(_ACTION_ADD, _SIDE_BUY, p, s, ts_ns))
+            for lv in asks:
+                p, s = _level(lv)
+                rows.append(_row(_ACTION_ADD, _SIDE_SELL, p, s, ts_ns))
+            if rows:
+                rows[-1]["flags"] = _FLAG_LAST
 
-            # ── Standard snapshot (most venues, including Bitfinex) ────
-            # Excludes "update" (Bitfinex/Deribit deltas) and "bbo" messages.
-            if ("bids" in msg or "asks" in msg) and mtype not in ("bbo", "update"):
-                bids = msg.get("bids", [])
-                asks = msg.get("asks", [])
-                rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
-                for level in bids:
-                    p, s = _parse_level(level)
-                    rows.append(_row(_ACTION_ADD, _SIDE_BUY, p, s, ts_ns))
-                for level in asks:
-                    p, s = _parse_level(level)
-                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, p, s, ts_ns))
-                if rows:
-                    rows[-1]["flags"] = _FLAG_LAST
+        # ── Kalshi L2: two-pass with ATM market filter ─────────────────────
+        first_type = messages[0].get("type", "")
+        if first_type in ("orderbook_snapshot", "orderbook_delta"):
+            # Pass 1: find ATM market (YES bid closest to 0.5)
+            ticker_init: dict[str, float] = {}
+            for msg in messages:
+                if msg.get("type") != "orderbook_snapshot":
+                    continue
+                inner  = msg.get("msg", {})
+                ticker = inner.get("market_ticker")
+                if not ticker or ticker in ticker_init:
+                    continue
+                yes_lvs = inner.get("yes_dollars_fp", [])
+                if yes_lvs:
+                    best = max(float(lv[0]) for lv in yes_lvs)
+                    ticker_init[ticker] = best
+            if not ticker_init:
+                return pd.DataFrame(columns=_empty_cols)
+            atm = min(ticker_init, key=lambda t: abs(ticker_init[t] - 0.5))
 
-            # ── BBO (bid/ask top-of-book only) ─────────────────────────
-            elif mtype == "bbo" or "best_bid" in msg or ("bid" in msg and "ask" in msg
-                                                         and "bids" not in msg):
-                if mtype == "bbo":
-                    bp, bs = msg.get("bid"),      msg.get("bid_size", 0)
-                    ap, as_ = msg.get("ask"),     msg.get("ask_size", 0)
-                else:
-                    bp, bs  = msg.get("best_bid"), msg.get("bid_size", 1)
-                    ap, as_ = msg.get("best_ask"), msg.get("ask_size", 1)
-                if bp is not None and ap is not None:
+            # Pass 2: emit OrderBookDelta rows for ATM market only
+            for msg in messages:
+                mtype = msg.get("type", "")
+                inner = msg.get("msg", {})
+                if inner.get("market_ticker") != atm:
+                    continue
+                ts_ns = ConvexLake._get_ts_ns(msg)
+
+                if mtype == "orderbook_snapshot":
+                    yes_lvs = inner.get("yes_dollars_fp", [])
+                    no_lvs  = inner.get("no_dollars_fp",  [])
+                    if not yes_lvs and not no_lvs:
+                        continue  # skip book-clear snapshots
                     rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
-                    rows.append(_row(_ACTION_ADD, _SIDE_BUY,  bp, bs,  ts_ns))
-                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, ap, as_, ts_ns, flags=_FLAG_LAST))
+                    for lv in yes_lvs:
+                        p, s = float(lv[0]), float(lv[1])
+                        if s > 0:
+                            rows.append(_row(_ACTION_ADD, _SIDE_BUY, p, s, ts_ns))
+                    for lv in no_lvs:
+                        p, s = float(lv[0]), float(lv[1])
+                        if s > 0:
+                            # NO bid at P → YES ask at 1-P so best_ask_price() is correct
+                            rows.append(_row(_ACTION_ADD, _SIDE_SELL, 1.0 - p, s, ts_ns))
+                    if rows:
+                        rows[-1]["flags"] = _FLAG_LAST
 
-            # ── Deribit L2 delta ───────────────────────────────────────
-            # {"type":"update","side":"bid"|"ask","action":"new"|"change"|"delete",
-            #  "price":p,"size":s,"local_timestamp":ms}
-            elif mtype == "update" and "side" in msg and "action" in msg:
-                side_str   = msg["side"]   # "bid" or "ask"
-                action_str = msg["action"] # "new", "change", "delete"
-                price      = float(msg.get("price", 0))
-                size       = float(msg.get("size",  0))
-                side       = _SIDE_BUY if side_str == "bid" else _SIDE_SELL
-                if action_str == "new":
-                    action = _ACTION_ADD
-                elif action_str == "change":
-                    action = _ACTION_UPDATE
-                else:  # "delete"
-                    action = _ACTION_DELETE
-                    size   = 0
-                rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
+                elif mtype == "orderbook_delta":
+                    p_raw = float(inner.get("price_dollars", 0))
+                    delta = float(inner.get("delta_fp", 0))
+                    if inner.get("side") == "yes":
+                        side  = _SIDE_BUY
+                        price = p_raw
+                    else:
+                        side  = _SIDE_SELL
+                        price = 1.0 - p_raw   # NO bid at P → YES ask at 1-P
+                    if delta == 0:
+                        rows.append(_row(_ACTION_DELETE, side, price, 0, ts_ns, flags=_FLAG_LAST))
+                    else:
+                        rows.append(_row(_ACTION_ADD, side, price, delta, ts_ns, flags=_FLAG_LAST))
 
-            # ── Bitfinex L2 delta ──────────────────────────────────────
-            # {"type":"update","price":p,"count":c,"amount":a,"local_timestamp":ms}
-            # count==0 → delete level (amount sign encodes side); count>0 → add/update
-            elif mtype == "update" and "count" in msg and "amount" in msg:
-                price  = float(msg["price"])
-                count  = int(msg["count"])
-                amount = float(msg["amount"])
-                side   = _SIDE_BUY if amount >= 0 else _SIDE_SELL
-                if count == 0:
-                    action = _ACTION_DELETE
-                    size   = 0
-                else:
-                    action = _ACTION_ADD
-                    size   = abs(amount)
-                rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
+        else:
+            # ── Non-Kalshi venues ───────────────────────────────────────────
 
-            # ── Kalshi orderbook_snapshot ──────────────────────────────
-            elif mtype == "orderbook_snapshot" and "msg" in msg:
-                inner = msg["msg"]
-                yes_levels = inner.get("yes_dollars_fp", [])
-                no_levels  = inner.get("no_dollars_fp",  [])
-                rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
-                for lv in yes_levels:
-                    rows.append(_row(_ACTION_ADD, _SIDE_BUY,  lv[0] / 100, lv[1], ts_ns))
-                for lv in no_levels:
-                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, lv[0] / 100, lv[1], ts_ns))
-                if rows:
-                    rows[-1]["flags"] = _FLAG_LAST
+            # Polymarket: filter to YES token (files contain both YES and NO asset_ids)
+            if "asset_id" in messages[0]:
+                messages = ConvexLake._polymarket_yes_token(messages)
 
-            # ── Kalshi orderbook_delta ─────────────────────────────────
-            elif mtype == "orderbook_delta" and "msg" in msg:
-                inner  = msg["msg"]
-                side   = _SIDE_BUY if inner.get("side") == "yes" else _SIDE_SELL
-                price  = inner.get("price", 0) / 100
-                delta  = inner.get("delta", 0)
-                if delta == 0:
-                    action = _ACTION_DELETE
-                    size   = 0
-                elif delta > 0:
-                    action = _ACTION_ADD
-                    size   = delta
-                else:
-                    action = _ACTION_UPDATE
-                    size   = abs(delta)
-                rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
+            for msg in messages:
+                ts_ns = ConvexLake._get_ts_ns(msg)
+                mtype = msg.get("type", "")
+
+                # ── Limitless: {"orderbook": {"bids": [...], "asks": [...]}} ──
+                if "orderbook" in msg:
+                    ob = msg["orderbook"]
+                    _emit_snapshot(ob.get("bids", []), ob.get("asks", []), ts_ns)
+
+                # ── Standard snapshot (Polymarket, Predict, Hyperliquid, …) ─
+                elif ("bids" in msg or "asks" in msg) and mtype not in ("bbo", "update"):
+                    _emit_snapshot(msg.get("bids", []), msg.get("asks", []), ts_ns)
+
+                # ── BBO (top-of-book only) ─────────────────────────────────
+                elif (mtype == "bbo" or "best_bid" in msg
+                      or ("bid" in msg and "ask" in msg and "bids" not in msg)):
+                    if mtype == "bbo":
+                        bp, bs  = msg.get("bid"),      msg.get("bid_size", 0)
+                        ap, as_ = msg.get("ask"),      msg.get("ask_size", 0)
+                    else:
+                        bp, bs  = msg.get("best_bid"), msg.get("bid_size", 1)
+                        ap, as_ = msg.get("best_ask"), msg.get("ask_size", 1)
+                    if bp is not None and ap is not None:
+                        rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
+                        rows.append(_row(_ACTION_ADD, _SIDE_BUY,  bp, bs,  ts_ns))
+                        rows.append(_row(_ACTION_ADD, _SIDE_SELL, ap, as_, ts_ns, flags=_FLAG_LAST))
+
+                # ── Deribit L2 delta ───────────────────────────────────────
+                elif mtype == "update" and "side" in msg and "action" in msg:
+                    side_str   = msg["side"]
+                    action_str = msg["action"]
+                    price      = float(msg.get("price", 0))
+                    size       = float(msg.get("size",  0))
+                    side       = _SIDE_BUY if side_str == "bid" else _SIDE_SELL
+                    if action_str == "new":
+                        action = _ACTION_ADD
+                    elif action_str == "change":
+                        action = _ACTION_UPDATE
+                    else:
+                        action = _ACTION_DELETE
+                        size   = 0
+                    rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
+
+                # ── Bitfinex L2 delta ──────────────────────────────────────
+                elif mtype == "update" and "count" in msg and "amount" in msg:
+                    price  = float(msg["price"])
+                    count  = int(msg["count"])
+                    amount = float(msg["amount"])
+                    side   = _SIDE_BUY if amount >= 0 else _SIDE_SELL
+                    if count == 0:
+                        action = _ACTION_DELETE
+                        size   = 0
+                    else:
+                        action = _ACTION_ADD
+                        size   = abs(amount)
+                    rows.append(_row(action, side, price, size, ts_ns, flags=_FLAG_LAST))
 
         if not rows:
-            return pd.DataFrame(columns=[
-                "instrument_id", "action", "side", "price", "size",
-                "order_id", "flags", "sequence", "ts_event", "ts_init",
-            ])
+            return pd.DataFrame(columns=_empty_cols)
 
         df = pd.DataFrame(rows)
         df = df.astype({
@@ -948,6 +1003,8 @@ class ConvexLake:
         yes_bids: dict[float, float] = {}
         no_bids:  dict[float, float] = {}
         rows: list[dict] = []
+        last_bid: float | None = None
+        last_ask: float | None = None
 
         for msg in messages:
             mtype  = msg.get("type", "")
@@ -959,13 +1016,18 @@ class ConvexLake:
             ts_ns = ConvexLake._get_ts_ns(msg)
 
             if mtype == "orderbook_snapshot":
+                yes_lvs = inner.get("yes_dollars_fp", [])
+                no_lvs  = inner.get("no_dollars_fp",  [])
+                # Skip empty snapshots (book-clear events) to preserve accumulated state
+                if not yes_lvs and not no_lvs:
+                    continue
                 yes_bids = {}
                 no_bids  = {}
-                for lv in inner.get("yes_dollars_fp", []):
+                for lv in yes_lvs:
                     p, s = float(lv[0]), float(lv[1])
                     if s > 0:
                         yes_bids[p] = s
-                for lv in inner.get("no_dollars_fp", []):
+                for lv in no_lvs:
                     p, s = float(lv[0]), float(lv[1])
                     if s > 0:
                         no_bids[p] = s
@@ -989,6 +1051,10 @@ class ConvexLake:
             ask = round(1.0 - max(no_bids), prec)
             if bid >= ask:
                 continue
+            # Only emit when BBO changes (avoid 100k+ duplicate rows)
+            if bid == last_bid and ask == last_ask:
+                continue
+            last_bid, last_ask = bid, ask
             rows.append({"ts_ns": ts_ns, "bid": bid, "ask": ask})
 
         if not rows:
