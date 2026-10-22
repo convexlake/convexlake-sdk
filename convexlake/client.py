@@ -746,3 +746,139 @@ class ConvexLake:
             price_precision=price_precision,
             size_precision=size_precision,
         )
+
+    @staticmethod
+    def to_quote_ticks(
+        messages: list[dict],
+        *,
+        price_precision: int = 4,
+    ) -> pd.DataFrame:
+        """
+        Convert BBO orderbook messages to a QuoteTick-compatible DataFrame.
+
+        Use this for BBO (best-bid/offer) data when backtesting with NautilusTrader's
+        L1_MBP book type. The resulting DataFrame can be converted to QuoteTick objects
+        for passive limit-order fill simulation.
+
+        Unlike to_nautilus() (which produces OrderBookDelta rows), QuoteTick data
+        allows NautilusTrader to fill resting limit orders when the market price
+        crosses the order price.
+
+        Supported message types
+        -----------------------
+        Snapshot with a single level  (type="snapshot", bids/asks each have one entry):
+            {"type": "snapshot", "bids": [[bid, size]], "asks": [[ask, size]], ...}
+        BBO message (type="bbo"):
+            {"type": "bbo", "bid": price, "ask": price, ...}
+        Generic best_bid/best_ask dict:
+            {"best_bid": price, "best_ask": price, ...}
+        Fallback — first bid + first ask from multi-level snapshot:
+            {"type": "snapshot", "bids": [[p1,s1],[p2,s2],...], "asks": [[...], ...], ...}
+
+        Parameters
+        ----------
+        messages : list[dict]
+            Raw messages from client.orderbook().
+        price_precision : int
+            Decimal places used to round prices (default 4).
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: ts_ns (uint64), bid (float64), ask (float64).
+            One row per BBO snapshot.  Rows with bid >= ask are dropped.
+
+        Example — convert to NautilusTrader QuoteTick objects
+        -----------------------------------------------------
+            from nautilus_trader.model.data import QuoteTick
+            from nautilus_trader.model.objects import Price, Quantity
+
+            df = ConvexLake.to_quote_ticks(msgs)
+            fmt = f"{{:.{4}f}}"
+            ticks = [
+                QuoteTick(
+                    instrument_id=iid,
+                    bid_price=Price.from_str(fmt.format(row.bid)),
+                    ask_price=Price.from_str(fmt.format(row.ask)),
+                    bid_size=Quantity.from_str("100"),
+                    ask_size=Quantity.from_str("100"),
+                    ts_event=int(row.ts_ns),
+                    ts_init=int(row.ts_ns),
+                )
+                for row in df.itertuples()
+            ]
+        """
+        rows: list[dict] = []
+        prec = price_precision
+
+        for msg in messages:
+            ts_ns = ConvexLake._get_ts_ns(msg)
+            mtype = msg.get("type", "")
+
+            bid: float | None = None
+            ask: float | None = None
+
+            if mtype == "bbo":
+                bid = msg.get("bid")
+                ask = msg.get("ask")
+            elif "best_bid" in msg and "best_ask" in msg:
+                bid = float(msg["best_bid"])
+                ask = float(msg["best_ask"])
+            elif ("bids" in msg or "asks" in msg) and mtype != "update":
+                bids = msg.get("bids", [])
+                asks = msg.get("asks", [])
+                if bids and asks:
+                    def _first(level: list) -> float:
+                        # handles both [price, size] and Bitfinex [price, count, amount]
+                        return float(level[0])
+                    bid = _first(bids[0])
+                    ask = _first(asks[0])
+
+            if bid is None or ask is None:
+                continue
+            bid = round(float(bid), prec)
+            ask = round(float(ask), prec)
+            if bid >= ask:
+                continue
+            rows.append({"ts_ns": ts_ns, "bid": bid, "ask": ask})
+
+        if not rows:
+            return pd.DataFrame(columns=["ts_ns", "bid", "ask"])
+
+        df = pd.DataFrame(rows)
+        df["ts_ns"] = df["ts_ns"].astype("uint64")
+        return df
+
+    def download_quote_ticks(
+        self,
+        exchange: str,
+        slug: str,
+        *,
+        ticker: str | None = None,
+        market: str | None = None,
+        date: str | None = None,
+        timeframe: str | None = None,
+        md_type: str | None = None,
+        price_precision: int = 4,
+    ) -> pd.DataFrame:
+        """
+        Download BBO orderbook data and return a QuoteTick-compatible DataFrame.
+
+        Convenience wrapper combining client.orderbook() and to_quote_ticks().
+        Use for BBO files (Polymarket BBO, etc.) when backtesting with NautilusTrader.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: ts_ns (uint64), bid (float64), ask (float64).
+        """
+        messages = self.orderbook(
+            exchange=exchange,
+            slug=slug,
+            ticker=ticker,
+            market=market,
+            date=date,
+            timeframe=timeframe,
+            md_type=md_type,
+        )
+        return self.to_quote_ticks(messages, price_precision=price_precision)
