@@ -253,6 +253,184 @@ Supported exchanges: `polymarket`, `limitless`
 
 ---
 
+## NautilusTrader integration
+
+The SDK ships a complete conversion pipeline for [NautilusTrader](https://nautilustrader.io)
+backtesting. Data flows through three stages:
+
+```
+orderbook() → list[dict]      raw messages from S3
+to_nautilus() → pd.DataFrame  NautilusTrader schema, int64 fixed-point encoding
+to_orderbook_deltas() → list  typed OrderBookDelta Cython objects for BacktestEngine
+```
+
+### All-in-one: `download_orderbook_deltas()`
+
+The simplest path — one call streams the file, converts every message, and returns
+`list[OrderBookDelta]` ready for `BacktestEngine.add_data()`:
+
+```python
+from convexlake import ConvexLake
+
+client = ConvexLake(api_key="do_XXXX...")
+
+deltas = client.download_orderbook_deltas(
+    exchange="binance",
+    instrument_id="BTCPERP.BINANCE",
+    slug="BTCPERP-book",
+    ticker="BTCPERP",
+    date="2026-11-04",
+    price_precision=1,
+    size_precision=3,
+)
+
+engine.add_data(deltas)
+engine.run(start=START, end=END)
+```
+
+Internally this runs `orderbook()` → `to_nautilus()` → `to_orderbook_deltas()`.
+
+---
+
+### Efficient path: filter at the DataFrame stage
+
+For large files (Binance full-day L2 book can produce 30 M+ delta objects), converting
+everything before filtering is expensive. Stay in DataFrame land as long as possible —
+pandas vectorized operations on int64 columns take milliseconds regardless of row count:
+
+```python
+from convexlake import ConvexLake
+from datetime import datetime, timezone
+
+WIN_START_NS = int(datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc).timestamp() * 1e9)
+WIN_END_NS   = int(datetime(2026, 11, 4, 14, 0, tzinfo=timezone.utc).timestamp() * 1e9)
+
+# Step 1 — download as DataFrame (raw messages → int64 schema)
+df = client.download_nautilus(
+    exchange="binance",
+    instrument_id="BTCPERP.BINANCE",
+    slug="BTCPERP-book",
+    ticker="BTCPERP",
+    date="2026-11-04",
+    price_precision=1,
+    size_precision=3,
+)
+
+# Step 2 — filter at the DataFrame stage (vectorized, instant)
+df = df[df["ts_event"].between(WIN_START_NS, WIN_END_NS)]
+
+# Step 3 — convert only the rows you need
+deltas = ConvexLake.to_orderbook_deltas(
+    df,
+    instrument_id="BTCPERP.BINANCE",
+    price_precision=1,
+    size_precision=3,
+)
+
+engine.add_data(deltas)
+```
+
+This produces the same result as `download_orderbook_deltas()` followed by a list
+comprehension filter, but avoids creating the Cython objects you will immediately discard.
+
+---
+
+### DataFrame schema
+
+`to_nautilus()` and `download_nautilus()` return a DataFrame with these columns:
+
+| Column | dtype | Description |
+|---|---|---|
+| `instrument_id` | `object` | NautilusTrader instrument identifier |
+| `action` | `uint8` | 1=ADD, 2=UPDATE, 3=DELETE, 4=CLEAR |
+| `side` | `uint8` | 0=NONE, 1=BUY, 2=SELL |
+| `price` | `int64` | price × 10^price_precision |
+| `size` | `uint64` | size × 10^size_precision |
+| `order_id` | `uint64` | always 0 (not tracked) |
+| `flags` | `uint8` | 1 = F_LAST (last delta in a snapshot sequence) |
+| `sequence` | `uint64` | monotonically increasing row counter |
+| `ts_event` | `uint64` | event timestamp, nanoseconds since epoch |
+| `ts_init` | `uint64` | same as ts_event |
+
+---
+
+### Persistent storage: `ParquetDataCatalog`
+
+For repeated backtests on the same data, write once to a NautilusTrader catalog instead
+of re-downloading or loading large pickle files:
+
+```python
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+catalog = ParquetDataCatalog("./nautilus_catalog")
+catalog.write_data(deltas)   # Arrow columnar — smaller and faster to reload than pickle
+```
+
+Read back for a later backtest:
+
+```python
+from nautilus_trader.backtest.config import BacktestDataConfig
+from nautilus_trader.model.data import OrderBookDelta
+
+data_config = BacktestDataConfig(
+    catalog_path="./nautilus_catalog",
+    data_cls=OrderBookDelta,
+    instrument_id=InstrumentId.from_str("BTCPERP.BINANCE"),
+    start_time=START,
+    end_time=END,
+)
+```
+
+---
+
+### L1/BBO: `download_quote_ticks()`
+
+For BBO files or when `BookType.L1_MBP` is sufficient, use `to_quote_ticks()` /
+`download_quote_ticks()`. This returns a lightweight DataFrame (`ts_ns`, `bid`, `ask`)
+that converts to `QuoteTick` objects — one object per BBO update instead of a CLEAR + two
+ADDs per snapshot:
+
+```python
+df = client.download_quote_ticks(
+    exchange="hyperliquid",
+    slug="BTCPERP-bbo",
+    ticker="BTCPERP",
+    date="2026-11-04",
+    price_precision=1,
+)
+
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.objects import Price, Quantity
+
+ticks = [
+    QuoteTick(
+        instrument_id=iid,
+        bid_price=Price(row.bid, 1),
+        ask_price=Price(row.ask, 1),
+        bid_size=Quantity(1, 3),
+        ask_size=Quantity(1, 3),
+        ts_event=int(row.ts_ns),
+        ts_init=int(row.ts_ns),
+    )
+    for row in df.itertuples()
+]
+engine.add_data(ticks)
+```
+
+---
+
+### Choosing between `OrderBookDelta` and `QuoteTick`
+
+| | `OrderBookDelta` (L2_MBP) | `QuoteTick` (L1_MBP) |
+|---|---|---|
+| Data depth | Full depth, all levels | Top of book only |
+| Fill simulation | Passive limit fills at quoted price | Passive limit fills when market crosses |
+| Objects per snapshot | CLEAR + N×ADD (N levels) | 1 |
+| Use for | Market-making, depth-sensitive strategies | Directional, simple spread strategies |
+| SDK method | `download_orderbook_deltas()` | `download_quote_ticks()` |
+
+---
+
 ## Error handling
 
 All exceptions inherit from `ConvexLakeError`.
@@ -303,10 +481,16 @@ On a `429` response the client waits for the `Retry-After` header value (default
 |---|:---:|:---:|:---:|:---:|:---:|
 | `kalshi` | ✓ | ✓ | ✓ | — | — |
 | `polymarket` | ✓ | ✓ | ✓ | — | ✓ |
-| `deribit` | ✓ | ✓ | ✓ (`_df`) | ✓ | — |
+| `deribit` | ✓ | ✓ | ✓ | ✓ | — |
 | `predict` | ✓ | — | ✓ | — | — |
 | `limitless` | — | — | ✓ | — | ✓ |
-| `hyperliquid` | ✓ | — | — | — | — |
+| `hyperliquid` | ✓ | ✓ | ✓ | — | — |
+| `binance` | — | — | ✓ | — | — |
+| `okx` | — | — | ✓ | — | — |
+| `bitfinex` | — | — | ✓ | — | — |
+
+> **Deribit options** orderbooks are CSV format — use `orderbook_df()` instead of `orderbook()`.  
+> **Bybit** stores perpetual options as individual CSV files; there is no single perp orderbook file.
 
 ---
 
