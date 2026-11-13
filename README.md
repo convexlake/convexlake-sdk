@@ -253,6 +253,105 @@ Supported exchanges: `polymarket`, `limitless`
 
 ---
 
+## Use with LangChain / LLM agents
+
+ConvexLake exposes two ways to use its data inside LangChain agents.
+
+### Option 1 — SDK tools (recommended for data analysis)
+
+Install:
+
+```bash
+pip install convexlake[langchain]
+```
+
+The SDK tools fetch data, summarise it, and return the result directly to the
+model. Use these when the agent needs to analyse, aggregate, or answer questions
+about market data.
+
+```python
+import os
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_anthropic import ChatAnthropic
+from convexlake.langchain import get_tools
+
+tools = get_tools(api_key=os.environ["CONVEXLAKE_API_KEY"])
+
+llm = ChatAnthropic(model="claude-sonnet-5-5")  # any LangChain chat model works
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a market data analyst. Use the ConvexLake tools to answer questions."),
+    ("human", "{input}"),
+    ("placeholder", "{agent_scratchpad}"),
+])
+
+agent = create_tool_calling_agent(llm, tools, prompt)
+executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+result = executor.invoke({
+    "input": "What was the taker buy/sell split on Kalshi BTC trades on 2026-10-01?"
+})
+print(result["output"])
+```
+
+**Getting the full DataFrame from a tool call**
+
+Tools return a text summary to the model. The full `pd.DataFrame` is available
+as the tool artifact when you invoke directly:
+
+```python
+tool = next(t for t in tools if t.name == "convexlake_trades")
+result = tool.invoke({
+    "exchange": "kalshi", "ticker": "crypto",
+    "date": "2026-10-01", "slug": "crypto-trades.csv",
+})
+# result is a string summary; the DataFrame is in the artifact
+# when invoked through a ToolMessage the artifact is in ToolMessage.artifact
+```
+
+---
+
+### Option 2 — MCP tools
+
+Install:
+
+```bash
+pip install convexlake[mcp]
+```
+
+The MCP tools connect to the hosted MCP server and return catalog entries and
+presigned download URLs. Use these when the agent only needs to discover what
+files exist and retrieve download links — not to analyse the data itself.
+
+```python
+import asyncio
+from convexlake.mcp import get_mcp_tools
+
+# Requires an OAuth 2.1 access token (see Auth note below)
+tools = asyncio.run(get_mcp_tools(
+    headers={"Authorization": "Bearer <oauth_access_token>"}
+))
+```
+
+**MCP auth note:** The ConvexLake MCP server uses OAuth 2.1 with dynamic client
+registration. API-key auth (`Bearer do_...` or `x-api-key`) returns HTTP 401.
+To use the MCP tools today you need an OAuth access token. API-key support is
+planned for a future server release.
+
+---
+
+### Which option to use?
+
+| | SDK tools (`convexlake[langchain]`) | MCP tools (`convexlake[mcp]`) |
+|---|---|---|
+| Auth | API key | OAuth 2.1 access token |
+| Returns | Summarised data (DataFrames) | Catalog metadata + download URLs |
+| Best for | Answering questions about data | Discovering and downloading files |
+| Works offline | Yes (data fetched locally) | No (hits MCP server) |
+
+---
+
 ## NautilusTrader integration
 
 The SDK ships a complete conversion pipeline for [NautilusTrader](https://nautilustrader.io)
