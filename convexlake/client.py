@@ -38,12 +38,13 @@ import ast
 import gzip
 import io
 import time
+import warnings
 from typing import Any
 
 import pandas as pd
 import requests
 
-from .exceptions import AuthError, ConvexLakeError, NotFoundError, PlanError, RateLimitError
+from .exceptions import AuthError, ConvexLakeError, MultipleChoicesError, NotFoundError, PlanError, RateLimitError
 
 BASE_URL = "https://api.convexlake.com"
 
@@ -76,6 +77,8 @@ class ConvexLake:
         self._session.headers.update({"x-api-key": api_key})
         self._timeout = timeout
         self._max_retries = max_retries
+        self.pm = _PMClient(self._get)
+        self.cx = _CXClient(self._get)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -102,6 +105,12 @@ class ConvexLake:
                 raise NotFoundError(f"No data found: {r.text}")
             if r.status_code == 400:
                 raise ConvexLakeError(f"Bad request: {r.text}")
+            if r.status_code == 300:
+                data = r.json()
+                raise MultipleChoicesError(
+                    data.get("error", "Multiple files match; pass slug= to select one"),
+                    data.get("slugs", []),
+                )
             r.raise_for_status()
             return r
         raise RateLimitError("Rate limit exceeded after all retries.")
@@ -201,6 +210,30 @@ class ConvexLake:
     # Public API
     # ------------------------------------------------------------------
 
+    def catalog(
+        self,
+        exchange: str | None = None,
+        ticker: str | None = None,
+        date: str | None = None,
+        data_type: str | None = None,
+    ) -> Any:
+        """
+        Browse available data (v2). Call progressively to drill down.
+
+        Examples:
+            client.catalog()                                    # namespaces + all exchanges
+            client.catalog(exchange="kalshi")                   # data types, tickers, date ranges
+            client.catalog(exchange="polymarket", ticker="btc") # available dates
+            client.catalog(exchange="polymarket", ticker="btc", date="2026-11-13")  # file slugs
+        """
+        r = self._get("/v2/catalog", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "date": date,
+            "data_type": data_type,
+        })
+        return r.json()
+
     def info(
         self,
         exchange: str | None = None,
@@ -210,16 +243,13 @@ class ConvexLake:
         date: str | None = None,
     ) -> Any:
         """
-        Browse available data. Call progressively to drill down.
-
-        Returns a dict with the listing at the current level.
-
-        Examples:
-            client.info()                                      # list exchanges
-            client.info(exchange="kalshi")                     # list tickers
-            client.info(exchange="kalshi", ticker="btc")       # list timeframes/dates
-            client.info(exchange="kalshi", ticker="btc", date="2026-07-30")  # list files
+        Browse available data (v1). Deprecated — use client.catalog() instead.
         """
+        warnings.warn(
+            "info() is deprecated; use catalog() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         r = self._get("/info", {
             "exchange": exchange,
             "ticker": ticker,
@@ -607,6 +637,8 @@ class ConvexLake:
                 rows[-1]["flags"] = _FLAG_LAST
 
         # ── Kalshi L2: two-pass with ATM market filter ─────────────────────
+        _KALSHI_TICK = 0.01  # synthetic ask offset for 15M yes-only mode
+
         first_type = messages[0].get("type", "")
         if first_type in ("orderbook_snapshot", "orderbook_delta"):
             # Pass 1: find ATM market (YES bid closest to 0.5)
@@ -626,46 +658,92 @@ class ConvexLake:
                 return pd.DataFrame(columns=_empty_cols)
             atm = min(ticker_init, key=lambda t: abs(ticker_init[t] - 0.5))
 
-            # Pass 2: emit OrderBookDelta rows for ATM market only
-            for msg in messages:
-                mtype = msg.get("type", "")
-                inner = msg.get("msg", {})
-                if inner.get("market_ticker") != atm:
-                    continue
-                ts_ns = ConvexLake._get_ts_ns(msg)
+            # Kalshi 15M markets: use YES-bid-only synthetic BBO to avoid crossed book.
+            # The NO book is skipped; best_ask is always best_yes_bid + KALSHI_TICK.
+            is_15m = "15M" in atm
 
-                if mtype == "orderbook_snapshot":
-                    yes_lvs = inner.get("yes_dollars_fp", [])
-                    no_lvs  = inner.get("no_dollars_fp",  [])
-                    if not yes_lvs and not no_lvs:
-                        continue  # skip book-clear snapshots
+            if is_15m:
+                # Track YES bid book and emit BBO updates on each best-bid change.
+                yes_bids_15m: dict[float, float] = {}
+                last_best: float | None = None
+                for msg in messages:
+                    mtype = msg.get("type", "")
+                    inner = msg.get("msg", {})
+                    if inner.get("market_ticker") != atm:
+                        continue
+                    ts_ns = ConvexLake._get_ts_ns(msg)
+                    if mtype == "orderbook_snapshot":
+                        yes_bids_15m.clear()
+                        for lv in inner.get("yes_dollars_fp", []):
+                            p, s = float(lv[0]), float(lv[1])
+                            if s > 0:
+                                yes_bids_15m[p] = s
+                    elif mtype == "orderbook_delta":
+                        if inner.get("side") != "yes":
+                            continue
+                        p_raw = float(inner.get("price_dollars", 0))
+                        delta = float(inner.get("delta_fp", 0))
+                        new_s = yes_bids_15m.get(p_raw, 0.0) + delta
+                        if new_s <= 0:
+                            yes_bids_15m.pop(p_raw, None)
+                        else:
+                            yes_bids_15m[p_raw] = new_s
+                    else:
+                        continue
+                    if not yes_bids_15m:
+                        continue
+                    best = round(max(yes_bids_15m.keys()), 4)
+                    if best == last_best:
+                        continue
+                    last_best = best
+                    best_s = yes_bids_15m[max(yes_bids_15m.keys())]
                     rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
-                    for lv in yes_lvs:
-                        p, s = float(lv[0]), float(lv[1])
-                        if s > 0:
-                            rows.append(_row(_ACTION_ADD, _SIDE_BUY, p, s, ts_ns))
-                    for lv in no_lvs:
-                        p, s = float(lv[0]), float(lv[1])
-                        if s > 0:
-                            # NO bid at P → YES ask at 1-P so best_ask_price() is correct
-                            rows.append(_row(_ACTION_ADD, _SIDE_SELL, 1.0 - p, s, ts_ns))
-                    if rows:
-                        rows[-1]["flags"] = _FLAG_LAST
+                    rows.append(_row(_ACTION_ADD, _SIDE_BUY,  best,                best_s, ts_ns))
+                    rows.append(_row(_ACTION_ADD, _SIDE_SELL, best + _KALSHI_TICK, best_s, ts_ns,
+                                     flags=_FLAG_LAST))
 
-                elif mtype == "orderbook_delta":
-                    p_raw = float(inner.get("price_dollars", 0))
-                    delta = float(inner.get("delta_fp", 0))
-                    if inner.get("side") == "yes":
-                        side  = _SIDE_BUY
-                        price = p_raw
-                    else:
-                        side  = _SIDE_SELL
-                        price = 1.0 - p_raw   # NO bid at P → YES ask at 1-P
-                    if delta == 0:
-                        rows.append(_row(_ACTION_DELETE, side, price, 0, ts_ns, flags=_FLAG_LAST))
-                    else:
-                        # abs(): delta_fp can be negative (decrement), only price matters for L2
-                        rows.append(_row(_ACTION_ADD, side, price, abs(delta), ts_ns, flags=_FLAG_LAST))
+            else:
+                # Pass 2: emit OrderBookDelta rows for ATM market only (KXBTCD etc.)
+                for msg in messages:
+                    mtype = msg.get("type", "")
+                    inner = msg.get("msg", {})
+                    if inner.get("market_ticker") != atm:
+                        continue
+                    ts_ns = ConvexLake._get_ts_ns(msg)
+
+                    if mtype == "orderbook_snapshot":
+                        yes_lvs = inner.get("yes_dollars_fp", [])
+                        no_lvs  = inner.get("no_dollars_fp",  [])
+                        if not yes_lvs and not no_lvs:
+                            continue  # skip book-clear snapshots
+                        rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
+                        for lv in yes_lvs:
+                            p, s = float(lv[0]), float(lv[1])
+                            if s > 0:
+                                rows.append(_row(_ACTION_ADD, _SIDE_BUY, p, s, ts_ns))
+                        for lv in no_lvs:
+                            p, s = float(lv[0]), float(lv[1])
+                            if s > 0:
+                                # NO bid at P → YES ask at 1-P so best_ask_price() is correct
+                                rows.append(_row(_ACTION_ADD, _SIDE_SELL, 1.0 - p, s, ts_ns))
+                        if rows:
+                            rows[-1]["flags"] = _FLAG_LAST
+
+                    elif mtype == "orderbook_delta":
+                        p_raw = float(inner.get("price_dollars", 0))
+                        delta = float(inner.get("delta_fp", 0))
+                        if inner.get("side") == "yes":
+                            side  = _SIDE_BUY
+                            price = p_raw
+                        else:
+                            side  = _SIDE_SELL
+                            price = 1.0 - p_raw   # NO bid at P → YES ask at 1-P
+                        if delta == 0:
+                            rows.append(_row(_ACTION_DELETE, side, price, 0, ts_ns, flags=_FLAG_LAST))
+                        else:
+                            # abs(): delta_fp can be negative (decrement), only price matters for L2
+                            rows.append(_row(_ACTION_ADD, side, price, abs(delta), ts_ns,
+                                             flags=_FLAG_LAST))
 
         else:
             # ── Non-Kalshi venues ───────────────────────────────────────────
@@ -690,12 +768,13 @@ class ConvexLake:
                 # ── BBO (top-of-book only) ─────────────────────────────────
                 elif (mtype == "bbo" or "best_bid" in msg
                       or ("bid" in msg and "ask" in msg and "bids" not in msg)):
-                    if mtype == "bbo":
-                        bp, bs  = msg.get("bid"),      msg.get("bid_size", 0)
-                        ap, as_ = msg.get("ask"),      msg.get("ask_size", 0)
-                    else:
+                    if "best_bid" in msg:
                         bp, bs  = msg.get("best_bid"), msg.get("bid_size", 1)
                         ap, as_ = msg.get("best_ask"), msg.get("ask_size", 1)
+                    else:
+                        # "bbo" type or Deribit ticker (type="ticker", keys: bid/ask/bid_size/ask_size)
+                        bp, bs  = msg.get("bid"),      msg.get("bid_size", 0)
+                        ap, as_ = msg.get("ask"),      msg.get("ask_size", 0)
                     if bp is not None and ap is not None:
                         rows.append(_row(_ACTION_CLEAR, _SIDE_NONE, 0, 0, ts_ns))
                         rows.append(_row(_ACTION_ADD, _SIDE_BUY,  bp, bs,  ts_ns))
@@ -747,6 +826,140 @@ class ConvexLake:
             "ts_init":  "uint64",
         })
         return df
+
+    @staticmethod
+    def to_orderbook_deltas(
+        df: "pd.DataFrame",
+        instrument_id: str,
+        *,
+        price_precision: int = 4,
+        size_precision: int = 2,
+    ) -> list:
+        """
+        Convert a to_nautilus() DataFrame to a list of NautilusTrader OrderBookDelta objects.
+
+        Takes the output of ConvexLake.to_nautilus() and produces ready-to-use
+        OrderBookDelta objects that can be passed directly to BacktestEngine.add_data()
+        or ParquetDataCatalog.write_data().
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame returned by to_nautilus() or download_nautilus().
+        instrument_id : str
+            NautilusTrader instrument identifier, e.g. "BTCPERP.BINANCE".
+        price_precision : int
+            Must match the price_precision used in to_nautilus() (default 4).
+        size_precision : int
+            Must match the size_precision used in to_nautilus() (default 2).
+
+        Returns
+        -------
+        list[OrderBookDelta]
+            Ready to pass to catalog.write_data() or engine.add_data().
+        """
+        from nautilus_trader.model.data import BookOrder, OrderBookDelta
+        from nautilus_trader.model.enums import BookAction, OrderSide
+        from nautilus_trader.model.identifiers import InstrumentId
+        from nautilus_trader.model.objects import Price, Quantity
+
+        iid = InstrumentId.from_str(instrument_id)
+        p_div = float(10 ** price_precision)
+        s_div = float(10 ** size_precision)
+
+        _action_map = {
+            _ACTION_ADD:    BookAction.ADD,
+            _ACTION_UPDATE: BookAction.UPDATE,
+            _ACTION_DELETE: BookAction.DELETE,
+        }
+
+        deltas: list = []
+        for row in df.itertuples(index=False):
+            action_int = int(row.action)
+            ts_e = int(row.ts_event)
+            ts_i = int(row.ts_init)
+            seq  = int(row.sequence)
+
+            if action_int == _ACTION_CLEAR:
+                deltas.append(OrderBookDelta.clear(iid, seq, ts_e, ts_i))
+                continue
+
+            side = OrderSide.BUY if int(row.side) == _SIDE_BUY else OrderSide.SELL
+            price_f = row.price / p_div
+            size_f  = 0.0 if action_int == _ACTION_DELETE else row.size / s_div
+
+            book_order = BookOrder(
+                side=side,
+                price=Price(price_f, price_precision),
+                size=Quantity(size_f, size_precision),
+                order_id=0,
+            )
+            deltas.append(OrderBookDelta(
+                instrument_id=iid,
+                action=_action_map[action_int],
+                order=book_order,
+                flags=int(row.flags),
+                sequence=seq,
+                ts_event=ts_e,
+                ts_init=ts_i,
+            ))
+
+        return deltas
+
+    def download_orderbook_deltas(
+        self,
+        exchange: str,
+        instrument_id: str,
+        slug: str,
+        *,
+        ticker: str | None = None,
+        market: str | None = None,
+        date: str | None = None,
+        timeframe: str | None = None,
+        md_type: str | None = None,
+        price_precision: int = 4,
+        size_precision: int = 2,
+    ) -> list:
+        """
+        Download orderbook data and return a list of NautilusTrader OrderBookDelta objects.
+
+        Convenience wrapper: orderbook() → to_nautilus() → to_orderbook_deltas().
+        The result can be passed directly to BacktestEngine.add_data() or
+        ParquetDataCatalog.write_data() without any further transformation.
+
+        Parameters
+        ----------
+        exchange : str
+            Exchange name, e.g. "binance", "hyperliquid", "deribit", "bitfinex".
+        instrument_id : str
+            NautilusTrader instrument identifier, e.g. "BTCPERP.BINANCE".
+        slug : str
+            File slug from client.info().
+        price_precision, size_precision : int
+            Fixed-point precision passed through to to_nautilus().
+
+        Returns
+        -------
+        list[OrderBookDelta]
+        """
+        df = self.download_nautilus(
+            exchange=exchange,
+            instrument_id=instrument_id,
+            slug=slug,
+            ticker=ticker,
+            market=market,
+            date=date,
+            timeframe=timeframe,
+            md_type=md_type,
+            price_precision=price_precision,
+            size_precision=size_precision,
+        )
+        return self.to_orderbook_deltas(
+            df,
+            instrument_id=instrument_id,
+            price_precision=price_precision,
+            size_precision=size_precision,
+        )
 
     def download_nautilus(
         self,
@@ -1001,64 +1214,104 @@ class ConvexLake:
             return pd.DataFrame(columns=["ts_ns", "bid", "ask"])
 
         atm = min(ticker_init, key=lambda t: abs(ticker_init[t] - 0.5))
+        is_15m = "15M" in atm
 
-        # Pass 2: reconstruct YES + NO books for ATM market only
-        yes_bids: dict[float, float] = {}
-        no_bids:  dict[float, float] = {}
         rows: list[dict] = []
-        last_bid: float | None = None
-        last_ask: float | None = None
 
-        for msg in messages:
-            mtype  = msg.get("type", "")
-            inner  = msg.get("msg", {})
-            ticker = inner.get("market_ticker")
-            if ticker != atm:
-                continue
-
-            ts_ns = ConvexLake._get_ts_ns(msg)
-
-            if mtype == "orderbook_snapshot":
-                yes_lvs = inner.get("yes_dollars_fp", [])
-                no_lvs  = inner.get("no_dollars_fp",  [])
-                # Skip empty snapshots (book-clear events) to preserve accumulated state
-                if not yes_lvs and not no_lvs:
+        if is_15m:
+            # KXBTC15M: YES-bid-only synthetic BBO (NO side creates crossed book).
+            # Emit bid = best_yes_bid, ask = bid + 0.01 whenever best bid changes.
+            _tick = 0.01
+            yes_bids_15m: dict[float, float] = {}
+            last_best: float | None = None
+            for msg in messages:
+                mtype = msg.get("type", "")
+                inner = msg.get("msg", {})
+                if inner.get("market_ticker") != atm:
                     continue
-                yes_bids = {}
-                no_bids  = {}
-                for lv in yes_lvs:
-                    p, s = float(lv[0]), float(lv[1])
-                    if s > 0:
-                        yes_bids[p] = s
-                for lv in no_lvs:
-                    p, s = float(lv[0]), float(lv[1])
-                    if s > 0:
-                        no_bids[p] = s
-
-            elif mtype == "orderbook_delta":
-                price = float(inner.get("price_dollars", 0))
-                delta = float(inner.get("delta_fp", 0))
-                side  = inner.get("side", "")
-                book  = yes_bids if side == "yes" else no_bids
-                if delta == 0:
-                    book.pop(price, None)
+                ts_ns = ConvexLake._get_ts_ns(msg)
+                if mtype == "orderbook_snapshot":
+                    yes_bids_15m.clear()
+                    for lv in inner.get("yes_dollars_fp", []):
+                        p, s = float(lv[0]), float(lv[1])
+                        if s > 0:
+                            yes_bids_15m[p] = s
+                elif mtype == "orderbook_delta":
+                    if inner.get("side") != "yes":
+                        continue
+                    p_raw = float(inner.get("price_dollars", 0))
+                    delta = float(inner.get("delta_fp", 0))
+                    new_s = yes_bids_15m.get(p_raw, 0.0) + delta
+                    if new_s <= 0:
+                        yes_bids_15m.pop(p_raw, None)
+                    else:
+                        yes_bids_15m[p_raw] = new_s
                 else:
-                    book[price] = delta
-            else:
-                continue
+                    continue
+                if not yes_bids_15m:
+                    continue
+                best = round(max(yes_bids_15m.keys()), prec)
+                if best == last_best:
+                    continue
+                last_best = best
+                rows.append({"ts_ns": ts_ns, "bid": best, "ask": round(best + _tick, prec)})
+        else:
+            # KXBTCD: combine YES bids + NO bids (1 - best_no_bid) for full BBO.
+            yes_bids: dict[float, float] = {}
+            no_bids:  dict[float, float] = {}
+            last_bid: float | None = None
+            last_ask: float | None = None
 
-            if not yes_bids or not no_bids:
-                continue
+            for msg in messages:
+                mtype  = msg.get("type", "")
+                inner  = msg.get("msg", {})
+                ticker = inner.get("market_ticker")
+                if ticker != atm:
+                    continue
 
-            bid = round(max(yes_bids), prec)
-            ask = round(1.0 - max(no_bids), prec)
-            if bid >= ask:
-                continue
-            # Only emit when BBO changes (avoid 100k+ duplicate rows)
-            if bid == last_bid and ask == last_ask:
-                continue
-            last_bid, last_ask = bid, ask
-            rows.append({"ts_ns": ts_ns, "bid": bid, "ask": ask})
+                ts_ns = ConvexLake._get_ts_ns(msg)
+
+                if mtype == "orderbook_snapshot":
+                    yes_lvs = inner.get("yes_dollars_fp", [])
+                    no_lvs  = inner.get("no_dollars_fp",  [])
+                    # Skip empty snapshots (book-clear events) to preserve accumulated state
+                    if not yes_lvs and not no_lvs:
+                        continue
+                    yes_bids = {}
+                    no_bids  = {}
+                    for lv in yes_lvs:
+                        p, s = float(lv[0]), float(lv[1])
+                        if s > 0:
+                            yes_bids[p] = s
+                    for lv in no_lvs:
+                        p, s = float(lv[0]), float(lv[1])
+                        if s > 0:
+                            no_bids[p] = s
+
+                elif mtype == "orderbook_delta":
+                    price = float(inner.get("price_dollars", 0))
+                    delta = float(inner.get("delta_fp", 0))
+                    side  = inner.get("side", "")
+                    book  = yes_bids if side == "yes" else no_bids
+                    if delta == 0:
+                        book.pop(price, None)
+                    else:
+                        book[price] = delta
+                else:
+                    continue
+
+                if not yes_bids or not no_bids:
+                    continue
+
+                bid = round(max(yes_bids), prec)
+                ask = round(1.0 - max(no_bids), prec)
+                if bid >= ask:
+                    continue
+                # Only emit when BBO changes (avoid 100k+ duplicate rows)
+                if bid == last_bid and ask == last_ask:
+                    continue
+                last_bid, last_ask = bid, ask
+                rows.append({"ts_ns": ts_ns, "bid": bid, "ask": ask})
 
         if not rows:
             return pd.DataFrame(columns=["ts_ns", "bid", "ask"])
@@ -1100,3 +1353,294 @@ class ConvexLake:
             md_type=md_type,
         )
         return self.to_quote_ticks(messages, price_precision=price_precision)
+
+
+# ---------------------------------------------------------------------------
+# v2 namespace clients
+# ---------------------------------------------------------------------------
+
+class _PMClient:
+    """
+    Prediction markets namespace (client.pm).
+
+    Exchanges: polymarket, kalshi, limitless, predict
+    """
+
+    def __init__(self, _get):
+        self._get = _get
+
+    def orderbook(
+        self,
+        exchange: str,
+        ticker: str,
+        timeframe: str,
+        date: str,
+        slug: str | None = None,
+        md_type: str | None = None,
+        fmt: str = "auto",
+    ) -> list[dict]:
+        """
+        Download orderbook data as a list of dicts.
+
+        Raises MultipleChoicesError when multiple files exist for the given params;
+        inspect .slugs and re-call with slug= to pick one.
+        """
+        r = self._get("/v2/pm/orderbook", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "timeframe": timeframe,
+            "date": date,
+            "slug": slug,
+            "md_type": md_type,
+        })
+        raw = ConvexLake._decompress(r)
+        return ConvexLake._parse_orderbook(raw, fmt=fmt)
+
+    def candles(
+        self,
+        exchange: str,
+        ticker: str,
+        date: str,
+        slug: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Download candle data as a DataFrame.
+
+        date: settlement/expiry date of the market (YYYY-MM-DD).
+        Raises MultipleChoicesError when multiple slugs match.
+        """
+        r = self._get("/v2/pm/candles", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "date": date,
+            "slug": slug,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def trades(
+        self,
+        exchange: str,
+        ticker: str,
+        date: str,
+        slug: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Download trade history as a DataFrame.
+
+        date: settlement/expiry date of the market (YYYY-MM-DD).
+        Raises MultipleChoicesError when multiple slugs match.
+        """
+        r = self._get("/v2/pm/trades", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "date": date,
+            "slug": slug,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def weather(
+        self,
+        exchange: str,
+        market: str,
+        date: str,
+        slug: str | None = None,
+        fmt: str = "auto",
+    ) -> list[dict]:
+        """
+        Download a weather orderbook as a list of dicts.
+
+        market: city/station slug e.g. "kxhighny", "nyc".
+        """
+        r = self._get("/v2/pm/weather", {
+            "exchange": exchange,
+            "market": market,
+            "date": date,
+            "slug": slug,
+        })
+        raw = ConvexLake._decompress(r)
+        return ConvexLake._parse_orderbook(raw, fmt=fmt)
+
+    def leaderboard(
+        self,
+        exchange: str,
+        date: str,
+    ) -> pd.DataFrame:
+        """
+        Download the daily leaderboard snapshot as a DataFrame.
+
+        Supported: polymarket, limitless, predict.
+        """
+        r = self._get("/v2/pm/leaderboard", {
+            "exchange": exchange,
+            "date": date,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def traders(
+        self,
+        exchange: str,
+    ) -> list[str]:
+        """
+        List all trader addresses seen in the leaderboard (auto-paginated).
+        """
+        addresses: list[str] = []
+        next_token: str | None = None
+        while True:
+            params: dict = {"exchange": exchange}
+            if next_token:
+                params["next_token"] = next_token
+            r = self._get("/v2/pm/traders", params)
+            data = r.json()
+            addresses.extend(data.get("addresses", []))
+            if not data.get("is_truncated"):
+                break
+            next_token = data.get("next_token")
+        return addresses
+
+    def trader_fills(
+        self,
+        exchange: str,
+        address: str,
+    ) -> pd.DataFrame:
+        """
+        Download per-trader fill history as a DataFrame.
+        """
+        r = self._get("/v2/pm/trader-fills", {
+            "exchange": exchange,
+            "address": address,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def resolutions(
+        self,
+        exchange: str,
+        ticker: str | None = None,
+    ) -> Any:
+        """
+        Download settled market resolutions.
+
+        Without ticker: returns a listing dict (slugs + hint).
+        With ticker (category slug): returns a DataFrame.
+        """
+        r = self._get("/v2/pm/resolutions", {
+            "exchange": exchange,
+            "ticker": ticker,
+        })
+        if ticker is None:
+            return r.json()
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+
+class _CXClient:
+    """
+    Crypto / derivatives namespace (client.cx).
+
+    Exchanges: deribit, binance, hyperliquid, okx, bybit, bitfinex
+    """
+
+    def __init__(self, _get):
+        self._get = _get
+
+    def candles(
+        self,
+        exchange: str,
+        ticker: str,
+        timeframe: str,
+    ) -> pd.DataFrame:
+        """
+        Download perpetuals / futures candles as a DataFrame (rolling file, no date).
+
+        Columns: timestamp_ms, open, high, low, close, volume, cost
+        """
+        r = self._get("/v2/cx/candles", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "timeframe": timeframe,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def trades(
+        self,
+        exchange: str,
+        ticker: str,
+        date: str,
+        slug: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Download options / perp trade history as a DataFrame.
+
+        Raises MultipleChoicesError when multiple slugs match (e.g. binance many instruments).
+        """
+        r = self._get("/v2/cx/trades", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "date": date,
+            "slug": slug,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def orderbook(
+        self,
+        exchange: str,
+        ticker: str,
+        timeframe: str,
+        date: str,
+        slug: str | None = None,
+        fmt: str = "auto",
+    ) -> list[dict] | pd.DataFrame:
+        """
+        Download orderbook data.
+
+        Returns list[dict] for perps (JSON snapshots) or pd.DataFrame for
+        Deribit options (CSV). Raises MultipleChoicesError when multiple slugs match.
+        """
+        r = self._get("/v2/cx/orderbook", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "timeframe": timeframe,
+            "date": date,
+            "slug": slug,
+        })
+        ct = r.headers.get("Content-Type", "")
+        raw = ConvexLake._decompress(r)
+        if "text/csv" in ct or (slug and slug.endswith(".csv")):
+            return ConvexLake._to_df(raw)
+        return ConvexLake._parse_orderbook(raw, fmt=fmt)
+
+    def surface(
+        self,
+        exchange: str,
+        ticker: str,
+        date: str,
+    ) -> pd.DataFrame:
+        """
+        Download implied volatility surface as a DataFrame.
+
+        Columns: snapshot_ts, instrument_name, expiry, strike, option_type,
+                 mark_iv, bid_price, ask_price, open_interest, ...
+        """
+        r = self._get("/v2/cx/surface", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "date": date,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
+
+    def funding(
+        self,
+        exchange: str,
+        ticker: str,
+        date: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Download funding rate history as a DataFrame.
+
+        date: optional YYYY-MM-DD to fetch a single day; None → full history.
+        Columns: timestamp, funding_rate, [mark_price, index_price, open_interest]
+        """
+        r = self._get("/v2/cx/funding", {
+            "exchange": exchange,
+            "ticker": ticker,
+            "date": date,
+        })
+        return ConvexLake._to_df(ConvexLake._decompress(r))
