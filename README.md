@@ -297,17 +297,22 @@ print(result["output"])
 
 **Getting the full DataFrame from a tool call**
 
-Tools return a text summary to the model. The full `pd.DataFrame` is available
-as the tool artifact when you invoke directly:
+Tools return a text summary to the model. `tool.invoke()` returns that summary
+string. To get the full `pd.DataFrame` in your own code, call the underlying
+function directly — it returns `(summary_str, DataFrame)`:
 
 ```python
 tool = next(t for t in tools if t.name == "convexlake_trades")
-result = tool.invoke({
-    "exchange": "kalshi", "ticker": "crypto",
-    "date": "2026-10-01", "slug": "crypto-trades.csv",
-})
-# result is a string summary; the DataFrame is in the artifact
-# when invoked through a ToolMessage the artifact is in ToolMessage.artifact
+
+# Option A — full DataFrame, bypassing the agent layer
+summary, df = tool.func(
+    exchange="kalshi", ticker="crypto",
+    date="2026-10-01", slug="crypto-trades.csv",
+)
+print(df.head())
+
+# Option B — inside a LangChain agent the artifact is in ToolMessage.artifact
+# (tool_message.artifact is the full DataFrame when the agent calls this tool)
 ```
 
 ---
