@@ -34,7 +34,7 @@ Documentation = "https://github.com/convexlake/convexlake-sdk#readme"
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.3"]
 mcp = ["langchain-mcp-adapters>=0.1", "langchain-core>=0.3"]
-dev = ["pytest", "responses", "langchain-core>=0.3", "langchain-mcp-adapters>=0.1"]
+dev = ["pytest", "pytest-asyncio", "responses", "langchain-core>=0.3", "langchain-mcp-adapters>=0.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]

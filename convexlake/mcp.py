@@ -93,6 +93,6 @@ async def get_mcp_tools(
             }
         }
     )
-    async with client:
-        tools = client.get_tools()
+    async with client as c:
+        tools = await c.get_tools()
     return tools

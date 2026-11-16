@@ -262,7 +262,7 @@ ConvexLake exposes two ways to use its data inside LangChain agents.
 Install:
 
 ```bash
-pip install convexlake[langchain]
+pip install "convexlake[langchain]" langchain langchain-anthropic
 ```
 
 The SDK tools fetch data, summarise it, and return the result directly to the
@@ -271,28 +271,20 @@ about market data.
 
 ```python
 import os
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_anthropic import ChatAnthropic
+from langchain.agents import create_agent
 from convexlake.langchain import get_tools
 
 tools = get_tools(api_key=os.environ["CONVEXLAKE_API_KEY"])
 
-llm = ChatAnthropic(model="claude-sonnet-5-5")  # any LangChain chat model works
+agent = create_agent(model="anthropic:claude-sonnet-5-5", tools=tools)
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a market data analyst. Use the ConvexLake tools to answer questions."),
-    ("human", "{input}"),
-    ("placeholder", "{agent_scratchpad}"),
-])
-
-agent = create_tool_calling_agent(llm, tools, prompt)
-executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-result = executor.invoke({
-    "input": "What was the taker buy/sell split on Kalshi BTC trades on 2026-10-01?"
+result = agent.invoke({
+    "messages": [{
+        "role": "user",
+        "content": "What was the taker buy/sell split on Kalshi BTC trades on 2026-10-01?"
+    }]
 })
-print(result["output"])
+print(result["messages"][-1].content)
 ```
 
 **Getting the full DataFrame from a tool call**
@@ -353,7 +345,6 @@ planned for a future server release.
 | Auth | API key | OAuth 2.1 access token |
 | Returns | Summarised data (DataFrames) | Catalog metadata + download URLs |
 | Best for | Answering questions about data | Discovering and downloading files |
-| Works offline | Yes (data fetched locally) | No (hits MCP server) |
 
 ---
 

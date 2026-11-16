@@ -17,7 +17,7 @@ def _mock_mcp_client(tools=None):
     mock_instance = AsyncMock()
     mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
     mock_instance.__aexit__ = AsyncMock(return_value=None)
-    mock_instance.get_tools = MagicMock(return_value=tools or [])
+    mock_instance.get_tools = AsyncMock(return_value=tools or [])
     mock_cls = MagicMock(return_value=mock_instance)
     return mock_cls, mock_instance
 

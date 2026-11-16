@@ -17,8 +17,15 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
 
+import requests
+
 from convexlake import ConvexLake
-from convexlake.exceptions import ConvexLakeError
+from convexlake.exceptions import (
+    ConvexLakeError,
+    MultipleChoicesError,
+    NotFoundError,
+    PlanError,
+)
 
 
 def get_tools(
@@ -137,15 +144,14 @@ def get_tools(
         try:
             df = client.pm.trades(exchange, ticker, date, slug=slug)
             return _summarise(df)
-        except ConvexLakeError as e:
-            msg = str(e)
-            if "NOT_FOUND" in msg or "no data" in msg.lower():
-                err = f"No trades found for {exchange}/{ticker}/{date}. Call convexlake_info to verify the slug."
-            elif "PLAN" in msg:
-                err = "This exchange is not in your subscription tier."
-            else:
-                err = f"Error fetching trades: {msg}"
-            return err, None
+        except MultipleChoicesError as e:
+            return f"Multiple files match — pass slug= one of: {e.slugs}", None
+        except NotFoundError:
+            return f"No trades found for {exchange}/{ticker}/{date}. Call convexlake_info to verify the slug.", None
+        except PlanError:
+            return "This exchange is not in your subscription tier.", None
+        except (ConvexLakeError, requests.RequestException) as e:
+            return f"Error fetching trades: {e}", None
 
     @tool(response_format="content_and_artifact")
     def convexlake_candles(
@@ -179,18 +185,17 @@ def get_tools(
             else:
                 return "Provide date (prediction markets) or timeframe+slug (crypto perpetuals).", None
             return _summarise(df)
-        except ConvexLakeError as e:
-            msg = str(e)
-            if "NOT_FOUND" in msg or "no data" in msg.lower():
-                err = (
-                    f"No candles found. Call convexlake_info(exchange='{exchange}', "
-                    f"ticker='{ticker}') to find valid dates and slugs."
-                )
-            elif "PLAN" in msg:
-                err = "This exchange is not in your subscription tier."
-            else:
-                err = f"Error fetching candles: {msg}"
-            return err, None
+        except MultipleChoicesError as e:
+            return f"Multiple files match — pass slug= one of: {e.slugs}", None
+        except NotFoundError:
+            return (
+                f"No candles found. Call convexlake_info(exchange='{exchange}', "
+                f"ticker='{ticker}') to find valid dates and slugs."
+            ), None
+        except PlanError:
+            return "This exchange is not in your subscription tier.", None
+        except (ConvexLakeError, requests.RequestException) as e:
+            return f"Error fetching candles: {e}", None
 
     @tool(response_format="content_and_artifact")
     def convexlake_surface(
@@ -215,15 +220,14 @@ def get_tools(
         try:
             df = client.cx.surface(exchange, ticker, date)
             return _summarise(df)
-        except ConvexLakeError as e:
-            msg = str(e)
-            if "NOT_FOUND" in msg or "no data" in msg.lower():
-                err = f"No surface data for {exchange}/{ticker}/{date}."
-            elif "PLAN" in msg:
-                err = "This exchange is not in your subscription tier."
-            else:
-                err = f"Error fetching surface: {msg}"
-            return err, None
+        except MultipleChoicesError as e:
+            return f"Multiple files match — pass slug= one of: {e.slugs}", None
+        except NotFoundError:
+            return f"No surface data for {exchange}/{ticker}/{date}.", None
+        except PlanError:
+            return "This exchange is not in your subscription tier.", None
+        except (ConvexLakeError, requests.RequestException) as e:
+            return f"Error fetching surface: {e}", None
 
     @tool(response_format="content_and_artifact")
     def convexlake_leaderboard(
@@ -248,18 +252,17 @@ def get_tools(
         try:
             df = client.pm.leaderboard(exchange, date)
             return _summarise(df)
-        except ConvexLakeError as e:
-            msg = str(e)
-            if "NOT_FOUND" in msg or "no data" in msg.lower():
-                err = (
-                    f"No leaderboard for {exchange}/{date}. "
-                    f"Call convexlake_info(exchange='{exchange}') to find the available date range."
-                )
-            elif "PLAN" in msg:
-                err = "This endpoint is not in your subscription tier."
-            else:
-                err = f"Error fetching leaderboard: {msg}"
-            return err, None
+        except MultipleChoicesError as e:
+            return f"Multiple files match — pass slug= one of: {e.slugs}", None
+        except NotFoundError:
+            return (
+                f"No leaderboard for {exchange}/{date}. "
+                f"Call convexlake_info(exchange='{exchange}') to find the available date range."
+            ), None
+        except PlanError:
+            return "This endpoint is not in your subscription tier.", None
+        except (ConvexLakeError, requests.RequestException) as e:
+            return f"Error fetching leaderboard: {e}", None
 
     @tool(response_format="content_and_artifact")
     def convexlake_leaderboard_trades(
@@ -293,15 +296,14 @@ def get_tools(
                 return content, addresses
             df = client.pm.trader_fills(exchange, address)
             return _summarise(df)
-        except ConvexLakeError as e:
-            msg = str(e)
-            if "NOT_FOUND" in msg or "no data" in msg.lower():
-                err = f"No fill history for address {address} on {exchange}."
-            elif "PLAN" in msg:
-                err = "This endpoint is not in your subscription tier."
-            else:
-                err = f"Error fetching trader data: {msg}"
-            return err, None
+        except MultipleChoicesError as e:
+            return f"Multiple files match — pass slug= one of: {e.slugs}", None
+        except NotFoundError:
+            return f"No fill history for address {address} on {exchange}.", None
+        except PlanError:
+            return "This endpoint is not in your subscription tier.", None
+        except (ConvexLakeError, requests.RequestException) as e:
+            return f"Error fetching trader data: {e}", None
 
     @tool
     def convexlake_orderbook_summary(
@@ -353,7 +355,7 @@ def get_tools(
 
             types: dict[str, int] = {}
             for m in msgs:
-                t = m.get("type", "unknown")
+                t = m.get("type") or m.get("event_type", "unknown")
                 types[t] = types.get(t, 0) + 1
 
             def _ts(m: dict) -> int | None:
@@ -368,21 +370,42 @@ def get_tools(
             if timestamps:
                 ts_summary = f"\nfirst_ts: {min(timestamps)}, last_ts: {max(timestamps)}"
 
+            def _best_bbo(m: dict) -> tuple[float | None, float | None]:
+                bids = m.get("bids") or []
+                asks = m.get("asks") or []
+                best_bid = max((float(b[0]) for b in bids if b), default=None)
+                best_ask = min((float(a[0]) for a in asks if a), default=None)
+                return best_bid, best_ask
+
+            SNAP_TYPES = {"orderbook_snapshot", "snapshot", "book_snapshot"}
+            snapshots = [m for m in msgs if (m.get("type") or m.get("event_type", "")) in SNAP_TYPES]
+            bbo_summary = ""
+            if snapshots:
+                fb, fa = _best_bbo(snapshots[0])
+                lb, la = _best_bbo(snapshots[-1])
+                if fb is not None or fa is not None:
+                    bbo_summary = (
+                        f"\nfirst_best_bid: {fb}, first_best_ask: {fa}"
+                        f"\nlast_best_bid: {lb}, last_best_ask: {la}"
+                    )
+
             return (
                 f"messages: {len(msgs)}"
                 f"\ntypes: {types}"
                 f"{ts_summary}"
+                f"{bbo_summary}"
             )
-        except ConvexLakeError as e:
-            msg = str(e)
-            if "NOT_FOUND" in msg or "no data" in msg.lower():
-                return (
-                    f"No orderbook found for {exchange}/{ticker}/{date}. "
-                    "Call convexlake_info to find valid slugs."
-                )
-            if "PLAN" in msg:
-                return "This exchange is not in your subscription tier."
-            return f"Error fetching orderbook: {msg}"
+        except MultipleChoicesError as e:
+            return f"Multiple files match — pass slug= one of: {e.slugs}"
+        except NotFoundError:
+            return (
+                f"No orderbook found for {exchange}/{ticker}/{date}. "
+                "Call convexlake_info to find valid slugs."
+            )
+        except PlanError:
+            return "This exchange is not in your subscription tier."
+        except (ConvexLakeError, requests.RequestException) as e:
+            return f"Error fetching orderbook: {e}"
 
     return [
         convexlake_info,
