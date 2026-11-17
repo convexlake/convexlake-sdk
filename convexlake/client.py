@@ -48,6 +48,23 @@ from .exceptions import AuthError, ConvexLakeError, MultipleChoicesError, NotFou
 
 BASE_URL = "https://api.convexlake.com"
 
+# hftbacktest event flags — combine with | to build the ev field
+_HFT_BUY                  = 1   # buy / bid side
+_HFT_SELL                 = 2   # sell / ask side
+_HFT_DEPTH_EVENT          = 4   # incremental L2 update (qty=0 means delete)
+_HFT_DEPTH_CLEAR_EVENT    = 8   # clear the whole book
+_HFT_DEPTH_SNAPSHOT_EVENT = 16  # snapshot level (replaces book on replay)
+_HFT_TRADE_EVENT          = 32  # aggTrade / print
+
+# dtype descriptor — passed to np.dtype() inside methods (no top-level numpy import)
+_HFT_DTYPE_DESC = [
+    ("ev",       "u8"),   # uint64 event flags
+    ("exch_ts",  "i8"),   # int64  exchange timestamp ns
+    ("local_ts", "i8"),   # int64  local receipt timestamp ns
+    ("px",       "f8"),   # float64 price
+    ("qty",      "f8"),   # float64 quantity
+]
+
 # NautilusTrader BookAction values
 _ACTION_ADD    = 1
 _ACTION_UPDATE = 2
@@ -1353,6 +1370,442 @@ class ConvexLake:
             md_type=md_type,
         )
         return self.to_quote_ticks(messages, price_precision=price_precision)
+
+    # ------------------------------------------------------------------
+    # hftbacktest integration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_exch_local_ts_ns(msg: dict) -> tuple[int, int]:
+        """Return (exch_ts_ns, local_ts_ns) from a message dict.
+
+        Prefers exchange_timestamp for exch and local_timestamp for local.
+        Falls back to any recognised timestamp field for both when only one
+        is present.  Milliseconds are detected by magnitude and converted.
+        """
+        def _to_ns(v: int) -> int:
+            if v >= 100_000_000_000_000_000:   # ≥ 1e17 → already ns
+                return v
+            if v >= 100_000_000_000_000:        # ≥ 1e14 → µs
+                return v * 1_000
+            return v * 1_000_000               # ms
+
+        exch_raw = msg.get("exchange_timestamp") or msg.get("exch_ts")
+        local_raw = msg.get("local_timestamp")  or msg.get("local_ts")
+
+        if exch_raw is None and local_raw is None:
+            # fall back to any generic timestamp field
+            ts = ConvexLake._get_ts_ns(msg)
+            return ts, ts
+
+        exch_ns  = _to_ns(int(exch_raw))  if exch_raw  is not None else None
+        local_ns = _to_ns(int(local_raw)) if local_raw is not None else None
+
+        if exch_ns is None:
+            exch_ns = local_ns
+        if local_ns is None:
+            local_ns = exch_ns
+
+        return exch_ns, local_ns
+
+    @staticmethod
+    def to_hftbacktest(messages: list[dict]) -> "Any":
+        """
+        Convert orderbook messages to a hftbacktest numpy event array.
+
+        Returns a structured ``numpy.ndarray`` with dtype
+        ``[ev(u8), exch_ts(i8), local_ts(i8), px(f8), qty(f8)]``.
+
+        The ``ev`` field is a bitfield that encodes the event type and side:
+
+        =============================  =======
+        Constant                       Value
+        =============================  =======
+        BUY side                       1
+        SELL side                      2
+        DEPTH_EVENT (incremental)      4
+        DEPTH_CLEAR_EVENT              8
+        DEPTH_SNAPSHOT_EVENT           16
+        TRADE_EVENT                    32
+        =============================  =======
+
+        Common ev values after OR-ing::
+
+            Bid snapshot level  : 17  (16 | 1)
+            Ask snapshot level  : 18  (16 | 2)
+            Bid depth update    :  5  ( 4 | 1)
+            Ask depth update    :  6  ( 4 | 2)
+            Clear book          :  8
+            Buy trade           : 33  (32 | 1)
+            Sell trade          : 34  (32 | 2)
+
+        Supported message formats
+        -------------------------
+        All formats accepted by :meth:`to_nautilus` are supported here too:
+        Binance / OKX / Bybit / Hyperliquid snapshots, Deribit L2 deltas,
+        Bitfinex L2 deltas, Limitless, Polymarket, Predict, Kalshi.
+
+        Parameters
+        ----------
+        messages : list[dict]
+            Raw messages returned by :meth:`orderbook`.
+
+        Returns
+        -------
+        numpy.ndarray
+            Structured array with dtype ``_HFT_DTYPE_DESC``.  Sort by
+            ``exch_ts`` before feeding to hftbacktest's ``merge_on_local_clock``.
+
+        Example
+        -------
+        ::
+
+            msgs = client.orderbook(exchange="binance", slug="BTCPERP-book.gz",
+                                    ticker="btc", date="2026-11-10")
+            arr = ConvexLake.to_hftbacktest(msgs)
+            # save as npz for hftbacktest
+            import numpy as np
+            np.savez_compressed("BTCPERP.npz", data=arr)
+        """
+        import numpy as np  # optional dep
+
+        if not messages:
+            return np.empty(0, dtype=np.dtype(_HFT_DTYPE_DESC))
+
+        rows: list[tuple] = []
+
+        def _level(lv) -> tuple[float, float]:
+            if isinstance(lv, dict):
+                p = float(lv["price"])
+                s = float(lv.get("size", lv.get("amount", 0)))
+                return p, s
+            if len(lv) == 3:          # Bitfinex: [price, count, amount]
+                return float(lv[0]), abs(float(lv[2]))
+            return float(lv[0]), float(lv[1])
+
+        def _emit_snapshot(bids: list, asks: list, exch_ns: int, local_ns: int) -> None:
+            rows.append((_HFT_DEPTH_CLEAR_EVENT, exch_ns, local_ns, 0.0, 0.0))
+            for lv in bids:
+                p, q = _level(lv)
+                rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_BUY, exch_ns, local_ns, p, q))
+            for lv in asks:
+                p, q = _level(lv)
+                rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_SELL, exch_ns, local_ns, p, q))
+
+        # ── Kalshi L2 ──────────────────────────────────────────────────────
+        first_type = messages[0].get("type", "")
+        if first_type in ("orderbook_snapshot", "orderbook_delta"):
+            ticker_init: dict[str, float] = {}
+            for msg in messages:
+                if msg.get("type") != "orderbook_snapshot":
+                    continue
+                inner  = msg.get("msg", {})
+                ticker = inner.get("market_ticker")
+                if not ticker or ticker in ticker_init:
+                    continue
+                yes_lvs = inner.get("yes_dollars_fp", [])
+                if yes_lvs:
+                    ticker_init[ticker] = max(float(lv[0]) for lv in yes_lvs)
+            if not ticker_init:
+                return np.empty(0, dtype=np.dtype(_HFT_DTYPE_DESC))
+            atm    = min(ticker_init, key=lambda t: abs(ticker_init[t] - 0.5))
+            is_15m = "15M" in atm
+
+            if is_15m:
+                yes_bids: dict[float, float] = {}
+                last_best: float | None = None
+                for msg in messages:
+                    mtype = msg.get("type", "")
+                    inner = msg.get("msg", {})
+                    if inner.get("market_ticker") != atm:
+                        continue
+                    exch_ns, local_ns = ConvexLake._get_exch_local_ts_ns(msg)
+                    if mtype == "orderbook_snapshot":
+                        yes_bids.clear()
+                        for lv in inner.get("yes_dollars_fp", []):
+                            p, s = float(lv[0]), float(lv[1])
+                            if s > 0:
+                                yes_bids[p] = s
+                    elif mtype == "orderbook_delta":
+                        if inner.get("side") != "yes":
+                            continue
+                        p_raw = float(inner.get("price_dollars", 0))
+                        delta = float(inner.get("delta_fp",      0))
+                        new_s = yes_bids.get(p_raw, 0.0) + delta
+                        if new_s <= 0:
+                            yes_bids.pop(p_raw, None)
+                        else:
+                            yes_bids[p_raw] = new_s
+                    else:
+                        continue
+                    if not yes_bids:
+                        continue
+                    best = round(max(yes_bids), 4)
+                    if best == last_best:
+                        continue
+                    last_best = best
+                    best_s = yes_bids[max(yes_bids)]
+                    rows.append((_HFT_DEPTH_CLEAR_EVENT, exch_ns, local_ns, 0.0, 0.0))
+                    rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_BUY,
+                                 exch_ns, local_ns, best, best_s))
+                    rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_SELL,
+                                 exch_ns, local_ns, round(best + 0.01, 4), best_s))
+            else:
+                for msg in messages:
+                    mtype = msg.get("type", "")
+                    inner = msg.get("msg", {})
+                    if inner.get("market_ticker") != atm:
+                        continue
+                    exch_ns, local_ns = ConvexLake._get_exch_local_ts_ns(msg)
+                    if mtype == "orderbook_snapshot":
+                        yes_lvs = inner.get("yes_dollars_fp", [])
+                        no_lvs  = inner.get("no_dollars_fp",  [])
+                        if not yes_lvs and not no_lvs:
+                            continue
+                        rows.append((_HFT_DEPTH_CLEAR_EVENT, exch_ns, local_ns, 0.0, 0.0))
+                        for lv in yes_lvs:
+                            p, s = float(lv[0]), float(lv[1])
+                            if s > 0:
+                                rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_BUY,
+                                             exch_ns, local_ns, p, s))
+                        for lv in no_lvs:
+                            p, s = float(lv[0]), float(lv[1])
+                            if s > 0:
+                                rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_SELL,
+                                             exch_ns, local_ns, 1.0 - p, s))
+                    elif mtype == "orderbook_delta":
+                        p_raw = float(inner.get("price_dollars", 0))
+                        delta = float(inner.get("delta_fp",      0))
+                        if inner.get("side") == "yes":
+                            ev    = _HFT_DEPTH_EVENT | _HFT_BUY
+                            price = p_raw
+                        else:
+                            ev    = _HFT_DEPTH_EVENT | _HFT_SELL
+                            price = 1.0 - p_raw
+                        rows.append((ev, exch_ns, local_ns, price, abs(delta)))
+
+        else:
+            # ── Non-Kalshi venues ──────────────────────────────────────────
+            if "asset_id" in messages[0]:
+                messages = ConvexLake._polymarket_yes_token(messages)
+
+            for msg in messages:
+                exch_ns, local_ns = ConvexLake._get_exch_local_ts_ns(msg)
+                mtype = msg.get("type", "")
+
+                if "orderbook" in msg:
+                    # Limitless: {"orderbook": {"bids": [...], "asks": [...]}}
+                    ob = msg["orderbook"]
+                    _emit_snapshot(ob.get("bids", []), ob.get("asks", []),
+                                   exch_ns, local_ns)
+
+                elif ("bids" in msg or "asks" in msg) and mtype not in ("bbo", "update"):
+                    # Snapshot: Binance, OKX, Bybit, Hyperliquid, Deribit, Predict, Polymarket
+                    _emit_snapshot(msg.get("bids", []), msg.get("asks", []),
+                                   exch_ns, local_ns)
+
+                elif (mtype == "bbo" or "best_bid" in msg
+                      or ("bid" in msg and "ask" in msg and "bids" not in msg)):
+                    # BBO
+                    if "best_bid" in msg:
+                        bp, bs  = msg.get("best_bid"), msg.get("bid_size", 1)
+                        ap, as_ = msg.get("best_ask"), msg.get("ask_size", 1)
+                    else:
+                        bp, bs  = msg.get("bid"), msg.get("bid_size", 0)
+                        ap, as_ = msg.get("ask"), msg.get("ask_size", 0)
+                    if bp is not None and ap is not None:
+                        rows.append((_HFT_DEPTH_CLEAR_EVENT, exch_ns, local_ns, 0.0, 0.0))
+                        rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_BUY,
+                                     exch_ns, local_ns, float(bp), float(bs or 0)))
+                        rows.append((_HFT_DEPTH_SNAPSHOT_EVENT | _HFT_SELL,
+                                     exch_ns, local_ns, float(ap), float(as_ or 0)))
+
+                elif mtype == "update" and "side" in msg and "action" in msg:
+                    # Deribit L2 delta
+                    side  = _HFT_BUY if msg["side"] == "bid" else _HFT_SELL
+                    price = float(msg.get("price", 0))
+                    qty   = float(msg.get("size",  0)) if msg["action"] != "delete" else 0.0
+                    rows.append((_HFT_DEPTH_EVENT | side, exch_ns, local_ns, price, qty))
+
+                elif mtype == "update" and "count" in msg and "amount" in msg:
+                    # Bitfinex L2 delta
+                    price  = float(msg["price"])
+                    amount = float(msg["amount"])
+                    side   = _HFT_BUY if amount >= 0 else _HFT_SELL
+                    qty    = abs(amount) if int(msg["count"]) > 0 else 0.0
+                    rows.append((_HFT_DEPTH_EVENT | side, exch_ns, local_ns, price, qty))
+
+        if not rows:
+            return np.empty(0, dtype=np.dtype(_HFT_DTYPE_DESC))
+
+        return np.array(rows, dtype=np.dtype(_HFT_DTYPE_DESC))
+
+    @staticmethod
+    def trades_to_hftbacktest(df: pd.DataFrame) -> "Any":
+        """
+        Convert a trades DataFrame (from :meth:`trades` or :meth:`cx.trades`) to a
+        hftbacktest numpy event array.
+
+        Column auto-detection
+        ---------------------
+        timestamp : ``timestamp_ms``, ``ts``, ``timestamp``, ``created_time``, ``time``
+        price     : ``price``, ``px``, ``yes_price``
+        size      : ``qty``, ``amount``, ``size``, ``count``
+        side      : ``side``, ``direction``, ``taker_side``
+
+        Side mapping
+        ------------
+        buy / long / yes / b → ``TRADE_EVENT | BUY``
+        all others            → ``TRADE_EVENT | SELL``
+
+        Returns
+        -------
+        numpy.ndarray
+            Same dtype as :meth:`to_hftbacktest`.  Timestamps are set identically
+            for exch_ts and local_ts (trades DataFrames carry only one timestamp).
+        """
+        import numpy as np
+
+        if df is None or df.empty:
+            return np.empty(0, dtype=np.dtype(_HFT_DTYPE_DESC))
+
+        cols = set(df.columns)
+
+        ts_col    = next((c for c in ("timestamp_ms", "ts", "timestamp", "created_time", "time") if c in cols), None)
+        price_col = next((c for c in ("price", "px", "yes_price")                               if c in cols), None)
+        size_col  = next((c for c in ("qty", "amount", "size", "count")                          if c in cols), None)
+        side_col  = next((c for c in ("side", "direction", "taker_side")                         if c in cols), None)
+
+        if ts_col is None or price_col is None or size_col is None:
+            raise ValueError(
+                f"Cannot determine required columns from {sorted(cols)}. "
+                "Need a timestamp, price, and size column."
+            )
+
+        rows: list[tuple] = []
+        for row in df.itertuples(index=False):
+            try:
+                ts_raw = int(getattr(row, ts_col))
+                price  = float(getattr(row, price_col))
+                qty    = float(getattr(row, size_col))
+            except (ValueError, TypeError):
+                continue
+
+            # ms → ns (magnitude-based, same logic as _get_ts_ns)
+            if ts_raw >= 100_000_000_000_000_000:
+                ts_ns = ts_raw
+            elif ts_raw >= 100_000_000_000_000:
+                ts_ns = ts_raw * 1_000
+            else:
+                ts_ns = ts_raw * 1_000_000
+
+            if side_col:
+                side_val = str(getattr(row, side_col, "")).lower()
+                ev = (_HFT_TRADE_EVENT | _HFT_BUY
+                      if side_val in ("buy", "long", "yes", "b")
+                      else _HFT_TRADE_EVENT | _HFT_SELL)
+            else:
+                ev = _HFT_TRADE_EVENT | _HFT_BUY   # unknown side
+
+            rows.append((ev, ts_ns, ts_ns, price, qty))
+
+        if not rows:
+            return np.empty(0, dtype=np.dtype(_HFT_DTYPE_DESC))
+
+        return np.array(rows, dtype=np.dtype(_HFT_DTYPE_DESC))
+
+    @staticmethod
+    def merge_hftbacktest(*arrays: "Any") -> "Any":
+        """
+        Merge two or more hftbacktest event arrays and sort by ``exch_ts``.
+
+        Typical use: combine an orderbook array and a trades array for the same
+        instrument and day before passing both to hftbacktest.
+
+        Parameters
+        ----------
+        *arrays : numpy.ndarray
+            One or more arrays returned by :meth:`to_hftbacktest` or
+            :meth:`trades_to_hftbacktest`.
+
+        Returns
+        -------
+        numpy.ndarray
+            Concatenated and time-sorted array.
+
+        Example
+        -------
+        ::
+
+            ob  = ConvexLake.to_hftbacktest(msgs)
+            tr  = ConvexLake.trades_to_hftbacktest(trades_df)
+            combined = ConvexLake.merge_hftbacktest(ob, tr)
+            np.savez_compressed("BTCPERP.npz", data=combined)
+        """
+        import numpy as np
+
+        non_empty = [a for a in arrays if len(a) > 0]
+        if not non_empty:
+            return np.empty(0, dtype=np.dtype(_HFT_DTYPE_DESC))
+        merged = np.concatenate(non_empty)
+        merged.sort(order="exch_ts")
+        return merged
+
+    def download_hftbacktest(
+        self,
+        exchange: str,
+        slug: str,
+        *,
+        ticker: str | None = None,
+        market: str | None = None,
+        date: str | None = None,
+        timeframe: str | None = None,
+        md_type: str | None = None,
+        fmt: str = "auto",
+    ) -> "Any":
+        """
+        Download orderbook data and return a hftbacktest event array.
+
+        Convenience wrapper combining :meth:`orderbook` and :meth:`to_hftbacktest`.
+        To include trades in the same array, fetch them separately with
+        :meth:`trades` / :meth:`cx.trades`, convert with
+        :meth:`trades_to_hftbacktest`, then merge with :meth:`merge_hftbacktest`.
+
+        Parameters
+        ----------
+        exchange : str
+            Exchange name, e.g. ``"binance"``, ``"hyperliquid"``, ``"deribit"``,
+            ``"okx"``, ``"bybit"``, ``"kalshi"``, ``"polymarket"``.
+        slug : str
+            File slug from :meth:`catalog` or :meth:`info`.
+        ticker, market, date, timeframe, md_type, fmt
+            Passed through to :meth:`orderbook`.
+
+        Returns
+        -------
+        numpy.ndarray
+            hftbacktest event array.  Save with ``np.savez_compressed("out.npz", data=arr)``.
+
+        Example
+        -------
+        ::
+
+            arr = client.download_hftbacktest(
+                exchange="binance", slug="BTCPERP-book.gz",
+                ticker="btc", date="2026-11-10",
+            )
+        """
+        messages = self.orderbook(
+            exchange=exchange,
+            slug=slug,
+            ticker=ticker,
+            market=market,
+            date=date,
+            timeframe=timeframe,
+            md_type=md_type,
+            fmt=fmt,
+        )
+        return self.to_hftbacktest(messages)
 
 
 # ---------------------------------------------------------------------------

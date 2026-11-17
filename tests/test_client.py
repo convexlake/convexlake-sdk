@@ -200,6 +200,189 @@ class TestParseOrderbook:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — to_hftbacktest
+# ─────────────────────────────────────────────────────────────────────────────
+
+import numpy as np
+
+_HFT_COLS = {"ev", "exch_ts", "local_ts", "px", "qty"}
+
+
+def _hft_snap(ts, bids, asks):
+    return {"type": "snapshot", "bids": bids, "asks": asks,
+            "exchange_timestamp": ts, "local_timestamp": ts + 1}
+
+
+def _hft_trade(ts, price, qty, side):
+    return {"type": "trade", "timestamp": ts, "price": price,
+            "qty": qty, "side": side}
+
+
+class TestToHftbacktest:
+    def test_empty_input_returns_empty_array(self):
+        arr = ConvexLake.to_hftbacktest([])
+        assert isinstance(arr, np.ndarray)
+        assert len(arr) == 0
+        assert set(arr.dtype.names) == _HFT_COLS
+
+    def test_snapshot_emits_clear_plus_levels(self):
+        msgs = [_hft_snap(1_000, [[50000.0, 1.0], [49999.0, 2.0]], [[50001.0, 1.5]])]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        # 1 clear + 2 bids + 1 ask = 4 rows
+        assert len(arr) == 4
+        assert int(arr[0]["ev"]) == 8    # DEPTH_CLEAR_EVENT
+        assert int(arr[1]["ev"]) == 17   # DEPTH_SNAPSHOT | BUY
+        assert int(arr[2]["ev"]) == 17   # DEPTH_SNAPSHOT | BUY
+        assert int(arr[3]["ev"]) == 18   # DEPTH_SNAPSHOT | SELL
+
+    def test_snapshot_prices_and_qtys(self):
+        msgs = [_hft_snap(1_000, [[100.0, 5.0]], [[101.0, 3.0]])]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        bid_row = arr[arr["ev"] == 17][0]
+        ask_row = arr[arr["ev"] == 18][0]
+        assert bid_row["px"]  == pytest.approx(100.0)
+        assert bid_row["qty"] == pytest.approx(5.0)
+        assert ask_row["px"]  == pytest.approx(101.0)
+        assert ask_row["qty"] == pytest.approx(3.0)
+
+    def test_exch_local_timestamps_ns(self):
+        # exchange_timestamp = 1_700_000_000_000 ms
+        ts_ms = 1_700_000_000_000
+        msgs = [_hft_snap(ts_ms, [[1.0, 1.0]], [[2.0, 1.0]])]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        assert int(arr[0]["exch_ts"])  == ts_ms * 1_000_000
+        assert int(arr[0]["local_ts"]) == (ts_ms + 1) * 1_000_000
+
+    def test_multiple_snapshots_produce_multiple_clears(self):
+        msgs = [
+            _hft_snap(1_000, [[50.0, 1.0]], [[51.0, 1.0]]),
+            _hft_snap(2_000, [[50.5, 2.0]], [[51.5, 2.0]]),
+        ]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        clears = arr[arr["ev"] == 8]
+        assert len(clears) == 2
+
+    def test_bbo_message_format(self):
+        msgs = [{"type": "bbo", "bid": 0.52, "bid_size": 100,
+                 "ask": 0.54, "ask_size": 80, "local_timestamp": 5_000}]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        assert len(arr) == 3  # clear + bid + ask
+        assert float(arr[1]["px"]) == pytest.approx(0.52)
+        assert float(arr[2]["px"]) == pytest.approx(0.54)
+
+    def test_deribit_delta_add(self):
+        msgs = [{"type": "update", "side": "bid", "action": "new",
+                 "price": 60000.0, "size": 0.5, "local_timestamp": 1_000}]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        assert len(arr) == 1
+        assert int(arr[0]["ev"]) == 5    # DEPTH_EVENT | BUY
+        assert float(arr[0]["px"])  == pytest.approx(60000.0)
+        assert float(arr[0]["qty"]) == pytest.approx(0.5)
+
+    def test_deribit_delta_delete_sets_qty_zero(self):
+        msgs = [{"type": "update", "side": "ask", "action": "delete",
+                 "price": 60001.0, "size": 0.0, "local_timestamp": 2_000}]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        assert int(arr[0]["ev"]) == 6    # DEPTH_EVENT | SELL
+        assert float(arr[0]["qty"]) == pytest.approx(0.0)
+
+    def test_dtypes(self):
+        msgs = [_hft_snap(1_000, [[1.0, 1.0]], [[2.0, 1.0]])]
+        arr = ConvexLake.to_hftbacktest(msgs)
+        assert arr.dtype["ev"].kind       == "u"
+        assert arr.dtype["exch_ts"].kind  == "i"
+        assert arr.dtype["local_ts"].kind == "i"
+        assert arr.dtype["px"].kind       == "f"
+        assert arr.dtype["qty"].kind      == "f"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — trades_to_hftbacktest
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTradesToHftbacktest:
+    def _df(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_buy_side_ev(self):
+        df = self._df([{"timestamp_ms": 1_000, "price": 50000.0, "qty": 0.1, "side": "buy"}])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert len(arr) == 1
+        assert int(arr[0]["ev"]) == 33   # TRADE_EVENT | BUY
+
+    def test_sell_side_ev(self):
+        df = self._df([{"timestamp_ms": 2_000, "price": 50001.0, "qty": 0.2, "side": "sell"}])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert int(arr[0]["ev"]) == 34   # TRADE_EVENT | SELL
+
+    def test_yes_side_maps_to_buy(self):
+        df = self._df([{"timestamp_ms": 1_000, "price": 0.6, "qty": 100, "side": "yes"}])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert int(arr[0]["ev"]) == 33
+
+    def test_direction_column_accepted(self):
+        df = self._df([{"timestamp_ms": 1_000, "price": 60000.0, "qty": 0.5, "direction": "long"}])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert int(arr[0]["ev"]) == 33
+
+    def test_timestamp_ms_to_ns(self):
+        ts_ms = 1_700_000_000_000
+        df = self._df([{"timestamp_ms": ts_ms, "price": 1.0, "qty": 1.0, "side": "buy"}])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert int(arr[0]["exch_ts"]) == ts_ms * 1_000_000
+
+    def test_deribit_columns(self):
+        df = self._df([{"timestamp_ms": 1_000, "price": 55000.0,
+                        "amount": 1.0, "direction": "sell"}])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert len(arr) == 1
+        assert float(arr[0]["qty"]) == pytest.approx(1.0)
+        assert int(arr[0]["ev"])    == 34
+
+    def test_empty_df(self):
+        df = pd.DataFrame(columns=["timestamp_ms", "price", "qty", "side"])
+        arr = ConvexLake.trades_to_hftbacktest(df)
+        assert len(arr) == 0
+
+    def test_missing_price_column_raises(self):
+        df = self._df([{"timestamp_ms": 1_000, "qty": 1.0, "side": "buy"}])
+        with pytest.raises(ValueError, match="price"):
+            ConvexLake.trades_to_hftbacktest(df)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests — merge_hftbacktest
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMergeHftbacktest:
+    def test_merges_and_sorts_by_exch_ts(self):
+        ob = ConvexLake.to_hftbacktest([
+            _hft_snap(2_000, [[50.0, 1.0]], [[51.0, 1.0]]),
+        ])
+        trades_df = pd.DataFrame([
+            {"timestamp_ms": 1_000, "price": 50.5, "qty": 0.5, "side": "buy"},
+        ])
+        tr = ConvexLake.trades_to_hftbacktest(trades_df)
+        merged = ConvexLake.merge_hftbacktest(ob, tr)
+        # trade timestamp (1_000ms→ns) < snapshot clear (2_000ms→ns)
+        assert int(merged[0]["ev"]) == 33    # trade comes first
+        assert int(merged[1]["ev"]) == 8     # then clear
+
+    def test_all_empty_returns_empty(self):
+        arr = ConvexLake.merge_hftbacktest(
+            np.empty(0, dtype=np.dtype(
+                [("ev","u8"),("exch_ts","i8"),("local_ts","i8"),("px","f8"),("qty","f8")]
+            )),
+        )
+        assert len(arr) == 0
+
+    def test_single_array_passthrough(self):
+        ob = ConvexLake.to_hftbacktest([_hft_snap(1_000, [[1.0, 1.0]], [[2.0, 1.0]])])
+        merged = ConvexLake.merge_hftbacktest(ob)
+        assert len(merged) == len(ob)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Unit tests — error mapping
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -593,20 +776,35 @@ _BEST_BBO_MSG = {
     "best_bid": 0.60, "best_ask": 0.62,
     "timestamp": 1_792_513_440_000,
 }
+_KALSHI_TICKER = "KXBTCD-26NOV15"
 _KALSHI_SNAP = {
     "type": "orderbook_snapshot",
+    "ts": 1_792_513_430_000,
     "msg": {
-        "yes_dollars_fp": [[53, 10], [52, 5]],
-        "no_dollars_fp":  [[47, 8],  [48, 3]],
+        "market_ticker": _KALSHI_TICKER,
+        "yes_dollars_fp": [[0.53, 10], [0.52, 5]],
+        "no_dollars_fp":  [[0.47, 8],  [0.48, 3]],
     },
 }
 _KALSHI_DELTA_ADD = {
     "type": "orderbook_delta",
-    "msg": {"side": "yes", "price": 54, "delta": 7},
+    "ts": 1_792_513_430_001,
+    "msg": {
+        "market_ticker": _KALSHI_TICKER,
+        "side": "yes",
+        "price_dollars": 0.54,
+        "delta_fp": 7,
+    },
 }
 _KALSHI_DELTA_DEL = {
     "type": "orderbook_delta",
-    "msg": {"side": "no", "price": 48, "delta": 0},
+    "ts": 1_792_513_430_002,
+    "msg": {
+        "market_ticker": _KALSHI_TICKER,
+        "side": "no",
+        "price_dollars": 0.48,
+        "delta_fp": 0,
+    },
 }
 
 
@@ -761,17 +959,19 @@ class TestToNautilus:
     # ── Kalshi delta ─────────────────────────────────────────────────────────
 
     def test_kalshi_delta_add(self):
-        df = ConvexLake.to_nautilus([_KALSHI_DELTA_ADD], self.ISTR, price_precision=4)
-        assert len(df) == 1
-        assert df.iloc[0]["action"] == 1   # ADD
-        assert df.iloc[0]["side"]   == 1   # BUY (yes)
-        assert df.iloc[0]["size"]   == 700 # 7 * 10^2
-        assert df.iloc[0]["flags"]  == 1   # F_LAST
+        # Snapshot must precede delta so ATM ticker can be identified in pass 1
+        df = ConvexLake.to_nautilus([_KALSHI_SNAP, _KALSHI_DELTA_ADD], self.ISTR, price_precision=4)
+        row = df.iloc[-1]  # delta appended after snapshot rows
+        assert int(row["action"]) == 1   # ADD
+        assert int(row["side"])   == 1   # BUY (yes)
+        assert int(row["size"])   == 700 # 7 * 10^2
+        assert int(row["flags"])  == 1   # F_LAST
 
     def test_kalshi_delta_delete(self):
-        df = ConvexLake.to_nautilus([_KALSHI_DELTA_DEL], self.ISTR, price_precision=4)
-        assert df.iloc[0]["action"] == 3   # DELETE
-        assert df.iloc[0]["side"]   == 2   # SELL (no)
+        df = ConvexLake.to_nautilus([_KALSHI_SNAP, _KALSHI_DELTA_DEL], self.ISTR, price_precision=4)
+        row = df.iloc[-1]
+        assert int(row["action"]) == 3   # DELETE
+        assert int(row["side"])   == 2   # SELL (no)
 
     # ── Custom precision ─────────────────────────────────────────────────────
 
